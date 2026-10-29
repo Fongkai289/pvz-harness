@@ -25,8 +25,13 @@ PLANT_COSTS = {
     "garlic": 50, "umbrella leaf": 100, "marigold": 50, "melon-pult": 300,
 }
 # Single-use plants: wasted unless a zombie is within reach in their row.
-INSTANT_KILLS = {"cherry bomb", "jalapeno", "squash", "doom-shroom", "potato mine", "tangle kelp"}
+INSTANT_KILLS = {"cherry bomb", "jalapeno", "squash", "doom-shroom", "tangle kelp"}
 INSTANT_KILL_REACH = 1  # columns between the plant and the row's nearest zombie
+# Traps arm after a delay (potato mine ~15 s; a normal zombie walks a column in ~4.7 s): wasted unless
+# the row's nearest zombie is still far enough right of the trap to arrive after it is armed. One
+# placed at the zombie's own column is behind it by then (real run, 2026-10-29).
+TRAPS = {"potato mine"}
+TRAP_REACH = (3, 6)  # columns the nearest zombie may stand right of the trap
 BASES = {"lily pad", "flower pot"}  # carry one more plant on top (water rows, roof)
 
 
@@ -57,8 +62,13 @@ def check(p: Placement, scene: Scene, planted: dict[tuple[int, int], list[str]],
     cost = PLANT_COSTS.get(card.plant)
     if scene.sun is not None and cost is not None and scene.sun - sun_spent < cost:
         return f"{card.plant} costs {cost}, sun left is {scene.sun - sun_spent}"
+    nearest = scene.nearest_col.get(p.row)
     if card.plant in INSTANT_KILLS:
-        nearest = scene.nearest_col.get(p.row)
         if nearest is None or abs(p.col - nearest) > INSTANT_KILL_REACH:
             return f"{card.plant} at column {p.col} has no zombie within reach in row {p.row}"
+    if card.plant in TRAPS:
+        lo, hi = TRAP_REACH
+        if nearest is None or not lo <= nearest - p.col <= hi:
+            return (f"{card.plant} at column {p.col} needs the row's nearest zombie {lo}-{hi} columns to its "
+                    f"right (row {p.row}: {'none' if nearest is None else f'column {nearest}'})")
     return None

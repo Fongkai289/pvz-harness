@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
@@ -40,6 +41,13 @@ class JevContext:
     plan_next: Placement | None
     planted: dict[tuple[int, int], list[str]]  # (row, col) -> plants: last seen lawn + own placements since
     used_slots: set[int] = field(default_factory=set)  # cards used since the scene was taken
+    # Layer 3 (hard rules) as a predicate, so tactics can pass over a card or cell it would reject
+    # instead of proposing the same rejected placement every second (2026-10-29: five seconds of
+    # "peashooter costs 100, sun left is 75" while a 50-sun Sunflower was usable).
+    check: Callable[[Placement], str | None] | None = None
+
+    def allows(self, place: Placement) -> bool:
+        return self.check is None or self.check(place) is None
 
     def ready_slots(self, plants: list[str]) -> list[int]:
         """Usable cards for a role, in the order of the role's plant list (its preference)."""
@@ -139,9 +147,15 @@ class OneJevJudge:
 Proposal = tuple[str | None, Placement | None]
 
 
-def _free(ctx: JevContext, row: int, cols, plant: str) -> int | None:
-    return next((c for c in cols if 0 <= c < geometry.COLS
-                 and hard_rules.cell_free_for(plant, ctx.planted.get((row, c), []))), None)
+def _pick(ctx: JevContext, slots: list[int], row: int, cols) -> Placement | None:
+    """The first card (in preference order) and column that is free and that the hard rules allow."""
+    for slot in slots:
+        for c in cols:
+            if 0 <= c < geometry.COLS and hard_rules.cell_free_for(ctx.plant(slot), ctx.planted.get((row, c), [])):
+                place = Placement(slot=slot, row=row, col=c)
+                if ctx.allows(place):
+                    return place
+    return None
 
 
 def _closest(ctx: JevContext) -> list[tuple[int, int]]:
@@ -163,8 +177,15 @@ def emergency(ctx: JevContext, policy: JevPolicy, j: Judgments) -> Proposal:
             why = f"tough zombie at column {col} in row {row} (tough_danger_col {policy.tough_danger_col})"
         else:
             continue
-        target = _free(ctx, row, [min(col, 8) + o for o in policy.emergency_offsets], ctx.plant(slots[0]))
-        return why, Placement(slot=slots[0], row=row, col=target) if target is not None else None
+        for slot in slots:
+            if ctx.plant(slot) in policy.armed_plants:  # must be armed before the zombie arrives
+                cols = [col - policy.armed_lead_cols, col - policy.armed_lead_cols - 1]
+            else:
+                cols = [min(col, 8) + o for o in policy.emergency_offsets]
+            place = _pick(ctx, [slot], row, cols)
+            if place is not None:
+                return why, place
+        return why, None
     return None, None
 
 
@@ -182,9 +203,9 @@ def attack(ctx: JevContext, policy: JevPolicy, j: Judgments) -> Proposal:
         if have >= want:
             continue
         why = why or f"row {row} has {have} shooter(s), wants {want}"
-        target = _free(ctx, row, policy.attack_cols, ctx.plant(slots[0]))
-        if target is not None:
-            return f"row {row} has {have} shooter(s), wants {want}", Placement(slot=slots[0], row=row, col=target)
+        place = _pick(ctx, slots, row, policy.attack_cols)
+        if place is not None:
+            return f"row {row} has {have} shooter(s), wants {want}", place
     return why, None
 
 
@@ -198,29 +219,33 @@ def reinforce(ctx: JevContext, policy: JevPolicy, j: Judgments) -> Proposal:
             continue
         why = why or f"row {row} has a zombie at column {col} and no wall"
         cols = range(min(col - policy.wall_gap, policy.wall_max_col), policy.wall_min_col - 1, -1)
-        target = _free(ctx, row, cols, ctx.plant(slots[0]))
-        if target is not None:
-            return f"row {row} has a zombie at column {col} and no wall", Placement(slot=slots[0], row=row, col=target)
+        place = _pick(ctx, slots, row, cols)
+        if place is not None:
+            return f"row {row} has a zombie at column {col} and no wall", place
     return why, None
 
 
 def follow_plan(ctx: JevContext, policy: JevPolicy, j: Judgments) -> Proposal:
-    return ("the planner has a next step", ctx.plan_next) if ctx.plan_next is not None else (None, None)
+    if ctx.plan_next is None:
+        return None, None
+    return "the planner has a next step", ctx.plan_next if ctx.allows(ctx.plan_next) else None
 
 
 def economy(ctx: JevContext, policy: JevPolicy, j: Judgments) -> Proposal:
     slots = ctx.ready_slots(policy.economy_plants)
-    if not slots or any(col <= policy.economy_safe_col for col in ctx.scene.nearest_col.values()):
-        return None, None
     have = ctx.count(policy.economy_plants)
-    if have >= policy.economy_target:
+    if not slots or have >= policy.economy_target:
         return None, None
-    why = f"no zombie within column {policy.economy_safe_col}, {have} economy plants"
+    early = have < policy.economy_first  # the first few go in even with zombies on the lawn
+    if not early and any(col <= policy.economy_safe_col for col in ctx.scene.nearest_col.values()):
+        return None, None
+    why = (f"{have} economy plants, economy_first {policy.economy_first}" if early
+           else f"no zombie within column {policy.economy_safe_col}, {have} economy plants")
     per_row = lambda r: sum(p in policy.economy_plants for (pr, _), cell in ctx.planted.items() if pr == r for p in cell)
     for row in sorted(range(ctx.scene.rows or geometry.ROWS), key=per_row):
-        col = _free(ctx, row, policy.economy_cols, ctx.plant(slots[0]))
-        if col is not None:
-            return why, Placement(slot=slots[0], row=row, col=col)
+        place = _pick(ctx, slots, row, policy.economy_cols)
+        if place is not None:
+            return why, place
     return why, None
 
 
@@ -235,7 +260,11 @@ ACTIONS = {"emergency": emergency, "attack": attack, "reinforce": reinforce, "fo
 def choose(ctx: JevContext, policy: JevPolicy, j: Judgments) -> tuple[str, str, Placement | None]:
     """The first action in priority order that applies and can be placed now (or wait)."""
     skipped = []
-    for action in policy.priorities:
+    priorities = list(policy.priorities)
+    if ctx.count(policy.economy_plants) < policy.economy_first and "emergency" in priorities:
+        priorities.remove("economy")
+        priorities.insert(priorities.index("emergency") + 1, "economy")
+    for action in priorities:
         why, place = ACTIONS[action](ctx, policy, j)
         if why is None:
             continue

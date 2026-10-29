@@ -79,9 +79,11 @@ class JevPolicy(BaseModel):
     and which column; and one fuzzy yes/no judgment asked of OneJev. OneJev picked "emergency" for calm
     scenes when asked to choose the action itself, but answered single yes/no facts 6/6 correctly (27B).
 
-    Actions, checked in the order of `priorities`; the first that holds AND can be placed now wins:
+    Actions, checked in the order of `priorities`; the first that holds AND can be placed now (passing the
+    hard rules) wins:
       emergency  zombie at column <= danger_col (or <= tough_danger_col in a row judged tough) and a
-                 usable emergency card: place it at that zombie's column + each of emergency_offsets in turn
+                 usable emergency card: place it at that zombie's column + each of emergency_offsets in turn;
+                 a card in armed_plants (needs time to arm) goes armed_lead_cols columns ahead (left) instead
       attack     a row with fewer shooters than shooters_per_row (shooters_per_tough_row if judged tough):
                  threatened rows first (closest zombie first), then, if attack_rows is "all", the others top
                  to bottom; the first free column of attack_cols
@@ -89,9 +91,12 @@ class JevPolicy(BaseModel):
                  min(zombie column - wall_gap, wall_max_col) down to wall_min_col
       follow_plan  the planner's next step
       economy    no zombie at column <= economy_safe_col and fewer than economy_target economy plants: the
-                 row with the fewest, the first free column of economy_cols
+                 row with the fewest, the first free column of economy_cols. While fewer than economy_first
+                 are on the lawn, economy is checked right after emergency and ignores economy_safe_col
+                 (2026-10-29 real run: zombies were always within column 5, so no Sunflower was ever placed)
       wait       always
-    Within a role, cards are tried in the order of its plant list.
+    Within a role, cards are tried in the order of its plant list, and the first card and column the hard
+    rules allow is taken.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -103,12 +108,16 @@ class JevPolicy(BaseModel):
     wall_trigger_col: int = Field(default=7, ge=0, le=9, description="zombie at or left of this column: wall the row")
     economy_safe_col: int = Field(default=5, ge=0, le=9, description="no zombie at or left of this column to add economy")
     economy_target: int = Field(default=10, ge=0, le=60, description="stop adding economy plants after this many")
+    economy_first: int = Field(default=0, ge=0, le=20,
+                               description="the first this many economy plants come right after emergency")
     shooters_per_row: int = Field(default=1, ge=0, le=5, description="attack until each row has this many shooters")
     shooters_per_tough_row: int = Field(default=2, ge=0, le=6, description="same, for rows judged tough")
     attack_rows: str = Field(default="all", description=f"one of {ATTACK_ROWS}: which rows attack fills")
     # where
     emergency_offsets: list[int] = Field(default=[0, -1, 1], min_length=1, max_length=3,
                                          description="columns tried relative to the zombie, in order (-1..1)")
+    armed_lead_cols: int = Field(default=3, ge=1, le=6,
+                                 description="columns ahead of the zombie for armed_plants (then one further)")
     attack_cols: list[int] = Field(default=[2, 1, 3, 4], min_length=1, max_length=9,
                                    description="columns tried for a shooter, in order")
     wall_gap: int = Field(default=1, ge=0, le=4, description="columns between the zombie and its wall")
@@ -118,6 +127,8 @@ class JevPolicy(BaseModel):
                                     description="columns tried for economy plants, in order")
     # which cards, in order of preference
     emergency_plants: list[str] = Field(default=["cherry bomb", "squash", "jalapeno", "potato mine"], max_length=10)
+    armed_plants: list[str] = Field(default=["potato mine"], max_length=10,
+                                    description="emergency plants that need time to arm, placed ahead of the zombie")
     attack_plants: list[str] = Field(default=["snow pea", "repeater", "threepeater", "peashooter"], max_length=10)
     wall_plants: list[str] = Field(default=["wall-nut", "tall-nut", "pumpkin"], max_length=10)
     economy_plants: list[str] = Field(default=["sunflower", "sun-shroom", "twin sunflower"], max_length=10)

@@ -78,6 +78,48 @@ def test_tough_judgment_widens_the_emergency_range():
     assert action == "emergency" and "tough" in reason and place.row == 2
 
 
+def checked(c, sun_spent=0):
+    """The context the session builds: tactics see the hard rules."""
+    c.check = lambda p: hard_rules.check(p, c.scene, c.planted, c.used_slots, sun_spent)
+    return c
+
+
+def test_armed_plants_go_ahead_of_the_zombie():
+    # Real run 2026-10-29: a potato mine went in at the zombie's own column, i.e. behind it once armed.
+    tough_row = Judgments(tough={2: 0.9})
+    action, _, place = act(checked(ctx(scene({2: 5}, ready=(4,)))), j=tough_row)
+    assert action == "emergency" and (place.slot, place.row, place.col) == (4, 2, 2)  # 3 columns ahead
+    assert act(checked(ctx(scene({2: 2}, ready=(4,)))))[2] is None  # no room left to arm in time
+
+
+def test_hard_rules_want_traps_well_ahead():
+    sc = scene({2: 5}, sun=500)
+    assert hard_rules.check(Placement(slot=4, row=2, col=2), sc, {}, set()) is None
+    assert "3-6 columns to its right" in hard_rules.check(Placement(slot=4, row=2, col=5), sc, {}, set())
+    assert "3-6 columns to its right" in hard_rules.check(Placement(slot=4, row=2, col=6), sc, {}, set())
+
+
+def test_economy_first_plants_sunflowers_before_attackers():
+    # Real run 2026-10-29: zombies always within column 5, so economy never ran and no Sunflower was placed.
+    c = ctx(scene({2: 4}))
+    assert act(c)[0] == "attack"
+    early = POLICY.model_copy(update={"economy_first": 3})
+    action, why, place = act(c, early)
+    assert action == "economy" and place.slot == 1 and place.col == 0 and "economy_first 3" in why
+    three = {(r, 0): ["sunflower"] for r in range(3)}
+    assert act(ctx(scene({2: 4}), planted=three), early)[0] == "attack"  # floor reached: back to normal
+
+
+def test_tactics_pass_over_what_the_hard_rules_reject():
+    # 75 sun, no wall-nut card: snow pea (175) and peashooter (100) are unaffordable, so attack yields
+    # to the next action instead of being proposed and rejected again; the Sunflower fits.
+    c = checked(ctx(scene({2: 6}, ready=(0, 1, 5), sun=75), planted={(r, 0): ["sunflower"] for r in range(5)}))
+    action, why, place = act(c, POLICY.model_copy(update={"economy_safe_col": 4}))
+    assert action == "economy" and place.slot == 1
+    # 120 sun: the preferred snow pea is too dear, the peashooter is taken instead of retrying.
+    assert act(checked(ctx(scene({2: 6}, sun=120))))[2].slot == 0
+
+
 def test_playbook_rejects_bad_where_settings():
     with pytest.raises(ValidationError):
         JevPolicy(priorities=["attack", "wait"])
