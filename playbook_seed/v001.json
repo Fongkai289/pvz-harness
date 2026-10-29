@@ -1,0 +1,15 @@
+{
+  "version": "v001",
+  "parent": null,
+  "perception": {
+    "sun_hsv_lo": [18, 120, 180],
+    "sun_hsv_hi": [35, 255, 255],
+    "sun_min_area": 600,
+    "sun_max_area": 5000
+  },
+  "fast": {
+    "sun_click_cooldown": 2.0,
+    "sun_same_spot_px": 30
+  },
+  "notes": "Seed playbook: the hand-written first guesses."
+}

@@ -1,0 +1,35 @@
+[project]
+name = "pvz-agent"
+version = "0.1.0"
+description = "Computer-use agent for Plants vs. Zombies: Windows thin client + remote server brain"
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.70",
+    "fastapi>=0.115",
+    "httpx>=0.27",
+    "numpy>=1.26",
+    "opencv-python-headless>=4.10",
+    "pydantic>=2.7",
+    "uvicorn[standard]>=0.30",
+    "websockets>=13",
+]
+
+[project.optional-dependencies]
+# Only needed on the Windows game machine.
+client = [
+    "mss>=9",
+    "psutil>=6",
+    "pydirectinput>=1.0.4",
+    "pymem>=1.13; sys_platform == 'win32'",  # read-only state reads for the judge
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
