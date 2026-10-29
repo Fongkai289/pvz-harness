@@ -90,6 +90,21 @@ def test_strategy_knowledge_block_fits_the_rules():
     assert "Sources" not in text  # notes for people stay out of the planner's prompt
 
 
+def test_human_edit_sets_fields_through_the_fixed_rules():
+    from rsi.human_edit import edit
+
+    current = Playbook.model_validate_json(open("playbook_seed/v001.json").read())
+    new, changes = edit(current, "v002", "real run", sets=["perception.sun_hsv_lo=[24,120,180]",
+                                                           "jev.economy_first=5"])
+    assert new.perception.sun_hsv_lo == (24, 120, 180) and new.jev.economy_first == 5
+    assert new.parent == "v001" and new.notes == "human edit: real run"
+    assert changes["jev.economy_first"] == [0, 5] and new.fast == current.fast
+    with pytest.raises(ValidationError):
+        edit(current, "v002", "x", sets=["jev.economy_first=99"])  # out of range
+    with pytest.raises(ValueError):
+        edit(current, "v002", "x", sets=["judge.weights=1"])  # not an editable section
+
+
 def test_coach_diff_names_section_and_field():
     from rsi.coach import Proposal, diff
 

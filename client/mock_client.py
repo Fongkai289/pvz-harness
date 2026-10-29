@@ -30,7 +30,9 @@ from common.protocol import Command
 
 W, H = 800, 600
 LAWN_BGR = (40, 140, 40)
-SUN_BGR = [(0, 190, 255), (0, 205, 255), (0, 215, 255), (0, 230, 255)]  # OpenCV hue ~22-27
+# OpenCV hue ~27-29, as measured on real suns (2026-10-29: 27.5-28.8). The earlier 22-27 overlapped the
+# real game's wall-nuts and potato mines (hue ~22-23), which a sun range wide enough for it clicked all game.
+SUN_BGR = [(0, 230, 255), (0, 235, 255), (0, 240, 255), (0, 245, 255)]
 DECOY_BGR = (0, 255, 230)  # OpenCV hue ~33: inside the seed range, outside a tight sun range
 SUN_RADIUS, SMALL_SUN_RADIUS, DECOY_RADIUS = 20, 13, 18
 SPAWN_P, SMALL_P, LIFETIME, FALL = 0.06, 0.33, 140, 2.0
