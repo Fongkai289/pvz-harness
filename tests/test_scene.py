@@ -63,6 +63,31 @@ def test_place_zombies_takes_rows_from_code_and_types_from_the_model():
     assert zs == [] and nearest == {}
 
 
+def test_look_plants_reads_a_code_matrix_from_the_cell_mosaic():
+    import base64
+
+    from server.scene import QwenLooker, plant_mosaic
+
+    seen = {}
+    matrix = [[0] * 9 for _ in range(5)]
+    matrix[0][0], matrix[1][2], matrix[4][8] = 3, 1, 4  # sorted names: peashooter, potato mine, sunflower, other
+
+    def handler(request):
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({"rows": matrix})}}],
+                                         "usage": {"completion_tokens": 159}})
+
+    looker = QwenLooker("http://qwen", "Qwen3.8-27B", timeout=5,
+                        client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    image = cv2.imread(str(FIXTURES / "day_1-6_f0073.jpg"))
+    result = asyncio.run(looker.look_plants(image, ["sunflower", "peashooter", "potato mine"]))
+    assert result.plants == {(0, 0): ["sunflower"], (1, 2): ["peashooter"], (4, 8): ["other plant"]}
+    content = seen["messages"][0]["content"]
+    sent = cv2.imdecode(np.frombuffer(base64.b64decode(content[0]["image_url"]["url"].split(",")[1]), np.uint8), 1)
+    assert sent.shape == plant_mosaic(image, 5).shape  # the tiles, not the screenshot
+    assert "1 = peashooter, 2 = potato mine, 3 = sunflower, 4 = other plant" in content[1]["text"]
+
+
 def test_classify_lawn_from_colour():
     from server.scene import classify_lawn
 
