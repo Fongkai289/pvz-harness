@@ -85,7 +85,8 @@ async def run(args) -> None:
         used = set()
         write_json(current_run / "experiment.json", {"seed": experiment_seed, "initial": initial,
                    "domain": "pvzemu-symbolic-v1", "baseline_only": args.baseline_only,
-                   "coach_mode": "external" if getattr(args, "candidate_json", None) else "internal_qwen"})
+                   "coach_mode": "external" if getattr(args, "candidate_json", None) else "internal_qwen",
+                   "architecture": "coach-engineer-judge-v1"})
         if args.baseline_only:
             play(initial, stage_seeds(rng, used, MIN_PAIRS["development"]), "baseline")
             update(state="baseline_complete", current=initial, learning_started=False)
@@ -113,12 +114,13 @@ async def run(args) -> None:
                              "origin": args.candidate_origin, "model_calls": 0}
                 else:
                     proposal, model = await propose_code(store.source(current), base, store.coach_history(), settings,
-                        controls=current_run, renderer_contract=CONTRACT, pixel_helpers=HELP_TEXT)
+                        controls=current_run, renderer_contract=CONTRACT, pixel_helpers=HELP_TEXT,
+                        on_phase=lambda state, **details: update(state=state, round=rnd, current=current, **details))
                     counts["coach_responses"] += 1
                 write_json(current_run / f"round{rnd}-proposal.json", {**proposal.model_dump(), "model": model})
                 validate_source(proposal.source, helper_names=HELPERS)
                 version = store.add(proposal.source, parent=current, rationale=proposal.rationale,
-                                    origin=args.candidate_origin if supplied else "qwen")
+                                    origin=args.candidate_origin if supplied else "qwen-engineer")
                 store.log(kind="proposal", round=rnd, version=version, parent=current,
                           diagnosis=proposal.diagnosis, rationale=proposal.rationale, model=model)
                 if version == current:
