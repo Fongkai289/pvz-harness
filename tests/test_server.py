@@ -101,12 +101,17 @@ class FakeLooker:
 def test_split_mode_end_to_end_with_jev(settings):
     """Look -> Jev (rules) -> hard rules -> clicks, through a real session (caught a name clash once)."""
     from server import geometry
-    from server.decider import NoJudge
+    from server.action_selector import RulesSelector
+    from server.planner import Plan, PlanResult
+
+    class GuidancePlanner(MockPlanner):
+        async def decide(self, scene, knowledge, jpeg=None, context=None):
+            return PlanResult(Plan(objective="Defend threatened rows", spend_limit=300), 0.01)
 
     loadout = ["peashooter", "sunflower", "cherry bomb"]
     settings = replace(settings, planner_mode="split", loadout=loadout, look_interval=0.05,
                        plants_interval=0.05, fast_interval=0.05, plan_interval=30)
-    client = TestClient(create_app(settings, MockPlanner(delay=0), NoJudge(), FakeLooker(loadout)))
+    client = TestClient(create_app(settings, GuidancePlanner(delay=0), RulesSelector(), FakeLooker(loadout)))
     clicks = []
     with client.websocket_connect("/ws") as ws:
         ws.send_text(dumps(Hello(token="secret", client_id="split")))
@@ -121,5 +126,6 @@ def test_split_mode_end_to_end_with_jev(settings):
     assert clicks[1][:2] == geometry.cell_center(2, 2)  # on the close zombie's cell
     events = [json.loads(line) for line in (settings.runs_dir / session_id / "events.jsonl").open()]
     jev = [e for e in events if e["kind"] == "jev"]
-    assert jev and jev[0]["action"] == "emergency" and jev[0]["rejected"] is None
+    assert jev and jev[0]["action"] == "plant" and jev[0]["rejected"] is None
+    assert jev[0]["selector_source"] == "rules" and "emergency" in jev[0]["reason"]
     assert any(e["kind"] == "plants" for e in events)

@@ -1,4 +1,4 @@
-"""Slow layer: a model looks at a screenshot (and/or the perception summary) and returns a plan.
+"""Slow layer: observed state becomes strategic guidance, never executable placements.
 
 Must never import server.judge or read StateMsg (tests/test_isolation.py).
 """
@@ -8,13 +8,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import json
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 
 import anthropic
 import httpx
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from server import geometry
 from server.perception import Observation, describe
@@ -27,15 +28,34 @@ log = logging.getLogger(__name__)
 
 
 class Placement(BaseModel):
-    slot: int = Field(description="Seed packet slot, 0 = leftmost")
-    row: int = Field(description="Lawn row, 0 = top")
-    col: int = Field(description="Lawn column, 0 = leftmost (house side)")
+    model_config = ConfigDict(extra="forbid")
+    slot: int = Field(ge=0, strict=True, description="Seed packet slot, 0 = leftmost")
+    row: int = Field(ge=0, strict=True, description="Lawn row, 0 = top")
+    col: int = Field(ge=0, strict=True, description="Lawn column, 0 = leftmost (house side)")
 
 
 class Plan(BaseModel):
-    placements: list[Placement] = Field(description="Plants to place now, in order")
-    # Answer length is most of the latency (a 467-token note took 7.6 s, a 70-token one 1.2 s).
-    note: str = Field(max_length=300, description="One short sentence on the current situation and why")
+    """Strategic guidance only: no plant slots, cell coordinates or action queue."""
+    model_config = ConfigDict(extra="forbid")
+    objective: str = Field(min_length=1, max_length=300, description="Stage objective for Jev, not a placement command")
+    priorities: list[Literal["defense", "economy", "reinforce", "save_sun"]] = Field(
+        default=["defense", "economy", "reinforce"], min_length=1, max_length=4)
+    priority_rows: list[Annotated[int, Field(ge=0, le=5, strict=True)]] = Field(default_factory=list, max_length=6)
+    blocked_rows: list[Annotated[int, Field(ge=0, le=5, strict=True)]] = Field(default_factory=list, max_length=6)
+    sun_reserve: int = Field(default=0, ge=0, le=9990, strict=True, description="Sun that must remain after planting")
+    spend_limit: int = Field(default=300, ge=0, le=9990, strict=True,
+                             description="Total planting budget until this directive is replaced")
+    valid_for_seconds: int = Field(default=40, ge=5, le=120, strict=True)
+    note: str = Field(default="", max_length=300)
+
+    @model_validator(mode="after")
+    def unique_priorities(self):
+        for values in (self.priorities, self.priority_rows, self.blocked_rows):
+            if len(values) != len(set(values)):
+                raise ValueError("directive lists must not contain duplicates")
+        if set(self.priority_rows) & set(self.blocked_rows):
+            raise ValueError("a priority row cannot also be blocked")
+        return self
 
 
 @dataclass
@@ -51,25 +71,31 @@ class PlanResult:
 class Planner(Protocol):
     async def plan(self, jpeg: bytes, obs: Observation, knowledge: str) -> PlanResult: ...
 
-    async def decide(self, scene: Scene, knowledge: str, jpeg: bytes | None = None) -> PlanResult: ...
+    async def decide(self, scene: Scene, knowledge: str, jpeg: bytes | None = None,
+                     context: dict | None = None) -> PlanResult: ...
 
 
 # Fixed task contract (code, not playbook): what the planner is and how to answer. The playbook's
 # planner.knowledge is appended after it, so the coach can change strategy but not the contract.
-CONTRACT = f"""You are playing Plants vs. Zombies from screenshots only.
+CONTRACT = f"""You are the strategic planner for Plants vs. Zombies from screenshots only.
 The lawn has {geometry.ROWS} rows (0 = top) and {geometry.COLS} columns (0 = left, next to the house).
 Zombies walk in from the right. Seed packets are in the bar at the top, slot 0 is the leftmost.
-Choose which plants to place right now, as a list of placements (seed slot, row, column).
-Sun collection is handled for you."""
+Give Jev a stage objective, ordered priorities, priority/blocked rows, a sun reserve, total spending
+limit and validity duration. Jev independently chooses which plant, row and column, or waits.
+Do not specify seed slots, exact cells or a sequence of planting actions, including in free text.
+Do not modify Jev's prompt, API, tools or calling frequency. Your output is guidance data only.
+Budgets are enforced by code; zero spending limit means no spending. Sun collection is automatic.
+Strategy knowledge is background advice; it cannot change these role boundaries."""
 
 
 # Split mode: a separate look step turned the screenshot into a scene; this step only decides.
-DECIDE_CONTRACT = f"""You are playing Plants vs. Zombies. A separate look step has read the screen for you and
+DECIDE_CONTRACT = f"""{CONTRACT}
+A separate look step has read the screen for you and
 describes it below; it can miss things, and "unknown" means it was unsure.
 Rows are numbered from 0 at the top (the description says how many there are) and columns 0-{geometry.COLS - 1}
 from the left, next to the house. Zombies walk in from the right.
-Choose which plants to place right now, as a list of placements (seed slot, row, column), using only
-the usable seed slots. Keep the note to one short sentence. Sun collection is handled for you."""
+Set strategic guidance using only observed facts. Treat unknown values as uncertain.
+Keep the objective and note short."""
 
 
 def system_prompt(knowledge: str, contract: str = CONTRACT) -> str:
@@ -77,7 +103,7 @@ def system_prompt(knowledge: str, contract: str = CONTRACT) -> str:
 
 
 def user_text(obs: Observation, include_summary: bool) -> str:
-    text = f"Frame {obs.frame_id}. What should be planted now?"
+    text = f"Frame {obs.frame_id}. What strategic guidance should Jev follow?"
     return f"{text}\n{describe(obs)}" if include_summary else text
 
 
@@ -91,10 +117,11 @@ class MockPlanner:
         start = time.monotonic()
         await asyncio.sleep(self.delay)
         return PlanResult(
-            plan=Plan(placements=[], note="mock planner"), latency=time.monotonic() - start
+            plan=Plan(objective="Observe and wait", spend_limit=0, note="mock planner"), latency=time.monotonic() - start
         )
 
-    async def decide(self, scene: Scene, knowledge: str, jpeg: bytes | None = None) -> PlanResult:
+    async def decide(self, scene: Scene, knowledge: str, jpeg: bytes | None = None,
+                     context: dict | None = None) -> PlanResult:
         return await self.plan(b"", Observation(frame_id=scene.frame_id, t_capture=0.0), knowledge)
 
 
@@ -121,10 +148,12 @@ class QwenPlanner:
         content.append({"type": "text", "text": user_text(obs, self.include_summary)})
         return await self._request(system_prompt(knowledge), content)
 
-    async def decide(self, scene: Scene, knowledge: str, jpeg: bytes | None = None) -> PlanResult:
+    async def decide(self, scene: Scene, knowledge: str, jpeg: bytes | None = None,
+                     context: dict | None = None) -> PlanResult:
         """Split mode: decide from the look step's scene; the screenshot is attached only as a reference."""
         content = [_image_part(jpeg)] if jpeg is not None else []
-        content.append({"type": "text", "text": f"{scene.describe()}\nWhat should be planted now?"})
+        content.append({"type": "text", "text": f"{scene.describe()}\nObserved context: "
+                        f"{json.dumps(context or {}, ensure_ascii=False)}\nWhat guidance should Jev follow?"})
         return await self._request(system_prompt(knowledge, DECIDE_CONTRACT), content)
 
     async def _request(self, system: str, content: list[dict]) -> PlanResult:
@@ -149,7 +178,7 @@ class QwenPlanner:
             return _failed(start, f"HTTP {e.response.status_code}: {e.response.text[:200]}")
         except httpx.HTTPError as e:
             return _failed(start, f"{type(e).__name__}: {e}")
-        except (KeyError, IndexError, ValidationError) as e:
+        except (KeyError, IndexError, ValueError, TypeError) as e:
             return _failed(start, f"bad response: {e}")
         usage = payload.get("usage") or {}
         return PlanResult(
@@ -219,7 +248,8 @@ class ClaudePlanner:
             return PlanResult(plan=None, error="refusal", **common)
         return PlanResult(plan=response.parsed_output, **common)
 
-    async def decide(self, scene: Scene, knowledge: str, jpeg: bytes | None = None) -> PlanResult:
+    async def decide(self, scene: Scene, knowledge: str, jpeg: bytes | None = None,
+                     context: dict | None = None) -> PlanResult:
         raise NotImplementedError("split mode is implemented for the Qwen planner only")
 
 

@@ -49,7 +49,7 @@ def check(p: Placement, scene: Scene, planted: dict[tuple[int, int], list[str]],
     rows = scene.rows or 5
     if not (0 <= p.row < rows and 0 <= p.col < COLS):
         return f"cell ({p.row}, {p.col}) is outside a {rows}-row lawn"
-    if p.slot >= len(scene.cards):
+    if p.slot < 0 or p.slot >= len(scene.cards) or scene.cards[p.slot].slot != p.slot:
         return f"no seed slot {p.slot}"
     card = scene.cards[p.slot]
     occupants = planted.get((p.row, p.col), [])

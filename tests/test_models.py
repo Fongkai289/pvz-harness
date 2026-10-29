@@ -27,16 +27,16 @@ def test_qwen_text_only_sends_summary_and_parses_plan():
 
     def handler(request):
         seen.update(json.loads(request.content))
-        plan = Plan(placements=[PLACEMENT], note="defend row 2")
+        plan = Plan(objective="Defend threatened rows", priority_rows=[2], sun_reserve=50, spend_limit=150)
         return httpx.Response(200, json={
             "id": "chatcmpl-1", "usage": {"prompt_tokens": 120, "completion_tokens": 30},
             "choices": [{"message": {"content": plan.model_dump_json()}}]})
 
     result = run(qwen_planner(handler, send_image=False).plan(b"jpeg", OBS, "Buy Sunflowers first."))
-    assert result.error is None and result.plan.placements == [PLACEMENT]
+    assert result.error is None and result.plan.priority_rows == [2] and result.plan.sun_reserve == 50
     assert result.input_tokens == 120
     system = seen["messages"][0]["content"]
-    assert system.startswith("You are playing Plants vs. Zombies") and system.endswith("Buy Sunflowers first.")
+    assert system.startswith("You are the strategic planner") and system.endswith("Buy Sunflowers first.")
     content = seen["messages"][1]["content"]
     assert [part["type"] for part in content] == ["text"]
     assert "1 sun visible" in content[0]["text"]

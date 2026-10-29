@@ -9,18 +9,18 @@ the judge and the run logs. Design doc: https://claude.ai/artifact/LoFF6d77152w5
 common/protocol.py     wire format shared by both sides
 server/                FastAPI WebSocket server (runs on the remote box)
   perception.py        pixels -> observation          (player side)
-  policy.py            fast layer, ~1 s, clicks         (player side)
+  policy.py            execute validated Jev choices + collect suns (player side)
   scene.py             look step: code reads cards + lawn type, Qwen reads sun + zombies per row; a separate,
                        slower Qwen read of the plants per cell (the lawn as seen is authoritative)
-  planner.py           big model, ~20 s: decide from the scene (split) or look+decide in one call (end_to_end)
-  decider.py           Jev, each second, three layers: OneJev-27B yes/no judgments per row (text facts only)
-                       -> playbook tactics (priorities + thresholds, code compares) -> hard rules -> clicks
+  planner.py           Qwen, ~20 s: objectives, priorities, row guidance and budget; no placements
+  action_selector.py   Jev, ~1 s: choose plant+row, then column, or wait; text-only model scoring
+  decider.py           legacy tactics, only for the explicit rules comparison baseline
   judge.py             ground-truth state, scoring      (privileged side)
   session.py           wires the layers for one client
   playbook.py          versioned playbooks: data/playbooks/vNNN.json, data/CURRENT, data/ledger.jsonl
 rules/playbook_rules.py  fixed rules the coach cannot change: sections, allowed fields and ranges
 rules/hard_rules.py    fixed checks on every placement: free cell, usable card, enough sun, instant kills in reach
-                       sections: perception (code) / fast (code) / decider (OneJev) / planner (Qwen)
+                       sections: perception (code) / fast (code) / jev (rules baseline) / planner (Qwen)
 knowledge/pvz_strategy.md  human-curated strategy from guides; planner block + notes and sources
 playbook_seed/v001.json  hand-written first playbook (seeds data/ on first start)
 rsi/
@@ -34,7 +34,7 @@ client/
   link.py              client half of the protocol
   mock_client.py       fake games for testing without Windows: --game suns (sun collecting) | lawn
   fake_lawn.py         drawn, simplified PvZ: cards, sun, plants, six zombie types, eating, mowers, win/lose
-  windows_client.py    real client (untested until environment verification)
+  windows_client.py    real client: screenshot capture, input execution and privileged state reporting
 tests/                 includes an import check that keeps state away from the player side
 ```
 
@@ -58,6 +58,49 @@ disk that can be lost if the container is rebuilt, so copy `runs/` back regularl
 `.env` (from `.env.example`) holds `PVZ_TOKEN` and, later,
 `ANTHROPIC_API_KEY` with `PVZ_PLANNER=claude`. The server runs in tmux session
 `pvz` (`tmux attach -t pvz`), logs to `logs/server.log`, writes runs to `runs/`.
+
+## Planner guidance and Jev action selection
+
+The live control contract is `planner-guidance-jev-placement-v1`. Planner output
+contains an objective, ordered priorities, priority/blocked rows, sun reserve,
+total spending limit and validity duration. The schema rejects placement lists,
+seed slots and cell coordinates. Free-text guidance is never executed as a tool
+call. The executor no longer has a planner placement queue.
+
+`PVZ_DECIDER=onejev` enumerates placements admitted by the existing hard rules
+and planner budget, then lets OneJev choose in two stages: plant+row, then column.
+All admitted columns in the chosen group remain available; tactical code does not
+preselect a single cell. Each stage includes wait. Both stages use the existing
+text-only `noul` API to score alternatives, with at most 61 and 10 questions
+respectively (10 cards / 6 rows), under one total `PVZ_DECIDER_TIMEOUT` deadline.
+This ranking protocol needs real-model quality and latency measurement; the old
+single-fact Jev measurements do not establish its performance on this task.
+
+Jev errors, malformed scores and timeouts mean wait, with no hidden rule fallback.
+`PVZ_DECIDER=rules` explicitly selects the old tactical baseline, subject to the
+same budget and placement checks. Its `jev` playbook settings are not consumed by
+the model selector. The retired tough-zombie model adapter has been removed.
+
+Before planting, the session rechecks guidance/scene freshness, changes during
+the model call, pause state, occupancy, card use and spending. Budgets accumulate
+across look updates and reset only when new planner guidance is accepted. A new
+scene does not erase commands issued after its screenshot. Episode boundaries
+invalidate pending results. Planner budget replacement cannot split the card/cell
+click pair. Sun collection remains code-driven and precedes Jev calls.
+
+Planting requires both a fresh observed scene and a valid directive. Without
+either, only sun collection continues. Qwen configurations keep the separate
+looker active even when the planner consumes screenshots (`end_to_end`); that
+mode no longer bypasses Jev. Other planner backends need a supplied looker for
+planting. `/health` reports the contract, selector and whether a looker is wired;
+it is not evidence that a fresh scene or successful model result exists.
+
+Logs retain planner directives, Jev scores/choice/latency/errors, rejected actions
+and budget usage. Local tests cover the model-response-to-click chain with fake
+HTTP responses; live Qwen/OneJev performance must be verified on the server.
+The native-emulator code-research loop below still evaluates generated Python
+players, not this multi-model live pipeline. Its candidates are not automatically
+promoted into this pipeline or the real client.
 
 ## Code research and native-emulator learning
 

@@ -15,7 +15,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from common.protocol import Hello, Welcome, dumps, parse_client_message
 from server.config import Settings, load_settings
-from server.decider import Judge, make_judge
+from server.action_selector import ActionSelector, make_selector
 from server.planner import Planner, make_planner
 from server.playbook import PlaybookStore
 from server.scene import QwenLooker
@@ -27,11 +27,11 @@ HELLO_TIMEOUT = 10.0
 
 
 def create_app(settings: Settings, planner: Planner | None = None,
-               jev_judge: Judge | None = None, looker: QwenLooker | None = None) -> FastAPI:
+               selector: ActionSelector | None = None, looker: QwenLooker | None = None) -> FastAPI:
     planner = planner or make_planner(settings)
-    jev_judge = jev_judge or make_judge(settings)
+    selector = selector or make_selector(settings)
     looker = looker or (QwenLooker(settings.qwen_url, settings.qwen_model, timeout=settings.planner_timeout)
-              if settings.planner_mode == "split" and settings.planner == "qwen" else None)
+              if settings.planner == "qwen" else None)
     store = PlaybookStore(settings.data_dir)
     app = FastAPI(title="pvz-agent server")
     app.state.sessions = {}
@@ -43,9 +43,11 @@ def create_app(settings: Settings, planner: Planner | None = None,
             "ok": True,
             "planner": settings.planner,
             "planner_model": planner_model,
-            "planner_mode": "split" if looker else "end_to_end",
+            "planner_mode": settings.planner_mode,
             "planner_send_image": settings.planner_send_image if settings.planner != "mock" else None,
             "jev": settings.decider,
+            "control_contract": "planner-guidance-jev-placement-v1",
+            "planting_ready": looker is not None,
             "jev_model": settings.onejev_model if settings.decider == "onejev" else None,
             "loadout": settings.loadout,
             "playbook": store.current(),
@@ -72,7 +74,7 @@ def create_app(settings: Settings, planner: Planner | None = None,
 
         client = re.sub(r"[^A-Za-z0-9_-]", "_", hello.client_id)[:32]
         session_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{client}-{secrets.token_hex(3)}"
-        session = Session(ws, settings, planner, jev_judge, playbook, session_id, looker)
+        session = Session(ws, settings, planner, selector, playbook, session_id, looker)
         session.runlog.event("hello", **hello.model_dump(exclude={"type", "token"}),
                              playbook_loaded=playbook.version)
         app.state.sessions[session_id] = session

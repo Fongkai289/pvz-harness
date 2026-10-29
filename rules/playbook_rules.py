@@ -72,7 +72,9 @@ ATTACK_ROWS = ("threatened", "all")
 
 
 class JevPolicy(BaseModel):
-    """Read by Jev's tactics code about once a second; the only model call is the tough-zombie judgment.
+    """Legacy tactics for the explicit rules baseline; not used by the OneJev action selector.
+
+    Historical policy format retained for existing playbook versions:
 
     Three layers (2026-10-28): hard rules in rules/hard_rules.py (fixed); these tactics, all numbers and
     orderings that code compares and follows (coach-editable): which action wins, which card, which row
@@ -163,8 +165,8 @@ class PlannerKnowledge(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     knowledge: str = Field(
-        default=("Only place a plant you can afford and whose seed packet is not on cooldown.\n"
-                 "Return an empty list when nothing should be placed."),
+        default=("Give Jev stage objectives, priorities and a budget consistent with the observed lawn.\n"
+                 "Leave concrete plant and cell choices to Jev; reserve sun when appropriate."),
         max_length=8000)
 
 

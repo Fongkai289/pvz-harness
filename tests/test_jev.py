@@ -1,15 +1,10 @@
-"""Jev in three layers: hard rules, playbook tactics (when, which card, where), OneJev yes/no judgments."""
-
-import asyncio
-import json
-
-import httpx
+"""Regression coverage for legacy rule tactics and fixed placement checks."""
 import pytest
 from pydantic import ValidationError
 
 from rules import hard_rules
 from rules.playbook_rules import JevPolicy
-from server.decider import JevContext, Judgments, OneJevJudge, choose, facts
+from server.decider import JevContext, Judgments, choose, facts
 from server.planner import Placement
 from server.scene import Card, Scene, Zombie
 
@@ -149,25 +144,3 @@ def test_facts_have_no_rules_text():
     text = facts(scene({1: 4}, types={1: "conehead"}), {(1, 2): ["lily pad", "peashooter"]})
     assert "Row 1: zombies conehead, nearest at column 4; plants peashooter on lily pad at column 2." in text
     assert "danger" not in text and "close" not in text  # thresholds stay in code
-
-
-def test_onejev_judge_asks_yes_no_per_row_text_only():
-    seen = {}
-
-    def ok(request):
-        seen.update(json.loads(request.content))
-        return httpx.Response(200, json={"answers": {"tough_row_2": {"type": "noul", "noul": 0.93}}})
-
-    judge = OneJevJudge("http://jev", "OneJev-27B", timeout=1,
-                        client=httpx.AsyncClient(transport=httpx.MockTransport(ok)))
-    j = asyncio.run(judge.judge(ctx(scene({2: 6}, types={2: "football"})), POLICY))
-    assert j.is_tough(2) and j.source == "onejev"
-    assert "media" not in seen and list(seen["questions"]) == ["tough_row_2"]
-    assert "football" in seen["questions"]["tough_row_2"]["instructions"]
-
-    def down(request):
-        return httpx.Response(503, text="No available workers")
-
-    judge.client = httpx.AsyncClient(transport=httpx.MockTransport(down))
-    failed = asyncio.run(judge.judge(ctx(scene({2: 6})), POLICY))
-    assert failed.source == "failed" and not failed.is_tough(2)  # no model: plain thresholds only

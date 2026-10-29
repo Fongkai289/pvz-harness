@@ -127,12 +127,12 @@ def test_decide_reads_the_scene_not_the_picture():
     def handler(request):
         seen.update(json.loads(request.content))
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(
-            {"placements": [{"slot": 0, "row": 1, "col": 2}], "note": "defend row 1"})}}]})
+            {"objective": "Defend threatened rows", "priority_rows": [1], "note": "defend row 1"})}}]})
 
     planner = QwenPlanner("http://qwen", "Qwen3.8-27B", send_image=False, include_summary=True, timeout=5,
                           client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     result = asyncio.run(planner.decide(SCENE, "Buy Sunflowers first."))
-    assert result.plan.placements[0].row == 1
+    assert result.plan.priority_rows == [1]
     assert seen["messages"][0]["content"].startswith(DECIDE_CONTRACT)
     content = seen["messages"][1]["content"]
     assert [p["type"] for p in content] == ["text"] and "row 1: conehead@col8" in content[0]["text"]
