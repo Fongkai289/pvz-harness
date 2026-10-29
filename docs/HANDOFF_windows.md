@@ -2,6 +2,10 @@
 
 写于 2026-10-28，由 Mac 上的 Claude Code 会话交给 Windows 上的新会话。
 
+> 更新：用户已于 2026-10-29 将全部开发与部署移交 Windows。下文第 3、9 节是历史分工，
+> 不再要求送回 Mac。共享服务器范围、只读游戏内存、玩家与裁判隔离、禁止向 OneJev 发图仍有效。
+> 新的模拟器代码学习入口与限制见 README 的“Code research and native-emulator learning”。
+
 ## 1. 项目一句话
 
 用"看截图 + 点鼠标"玩《植物大战僵尸》的 computer-use 智能体，带 RSI 循环：教练改策略本（playbook），用固定测试局打分，变好就升级，变差就回滚。
