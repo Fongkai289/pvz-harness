@@ -54,8 +54,8 @@ class Settings:
     max_run_bytes: int
 
 
-def load_settings() -> Settings:
-    _load_dotenv(ROOT / ".env")
+def load_settings(dotenv_path: Path | None = None) -> Settings:
+    _load_dotenv(dotenv_path if dotenv_path is not None else ROOT / ".env")
     token = os.environ.get("PVZ_TOKEN", "")
     if not token:
         raise RuntimeError("PVZ_TOKEN is not set; put it in .env (see .env.example)")

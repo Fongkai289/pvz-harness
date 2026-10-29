@@ -4,7 +4,8 @@
 
 **2026-10-29 起，开发全部转到 Windows**：客户端、服务器端代码（`server/`、`rules/`、`rsi/`、`tests/`）和部署都由 Windows 这边负责，交接文档里"Mac 负责服务器"的分工不再适用。
 接管前比对过：本地代码是服务器代码的超集（服务器上只少了 `pyproject.toml` 里的 pymem 一行），并把服务器上的 `uv.lock` 拉回了本地。
-`scripts/deploy.sh` 是 Mac 上用 bash + rsync 写的部署脚本，Windows 上的部署方式还没做。
+`scripts/deploy.sh` 是旧 Mac 部署脚本；Windows 使用 `scripts/deploy.ps1`。
+模拟器代码学习另用 `scripts/start_learning.ps1`，目标为独立的 `/root/fkchang/pvz-learning`。
 
 同一天的清理：
 - 服务器 `/root/fkchang`：删掉了 Mac 会话留下的 13 个一次性实验脚本、3 张图片、`pvz_shots/`、缓存，以及 `runs/` 里昨天 95 局假游戏评测记录（只留了今天那局真游戏）。
