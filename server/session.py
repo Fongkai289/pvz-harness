@@ -175,9 +175,15 @@ class Session:
             obs = self._fresh_obs()
             if obs is None or self.paused:
                 continue
-            place = await self._jev_step(obs)
-            for click in self.policy.tick(obs, place=place):
+            # Suns first: they must never wait behind a model call. On 2026-10-29 OneJev (a shared pool)
+            # took up to its 1 s timeout and capture-to-click p95 went from 346 ms to 1256 ms.
+            for click in self.policy.tick(obs):
                 await self.send("click", obs, meta=click.meta, x=click.x, y=click.y, reason=click.reason)
+            place = await self._jev_step(obs)
+            if place is not None:
+                obs = self._fresh_obs() or obs  # suns that appeared meanwhile go out with the placement
+                for click in self.policy.tick(obs, place=place):
+                    await self.send("click", obs, meta=click.meta, x=click.x, y=click.y, reason=click.reason)
             if place is not None:
                 card = self.settings.loadout[place.slot] if place.slot < len(self.settings.loadout) else "?"
                 self.placed_since.append((obs.frame_id, place.row, place.col, card))

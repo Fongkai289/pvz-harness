@@ -147,8 +147,13 @@ def read_cards(image: np.ndarray, loadout: list[str]) -> list[Card]:
 
 
 ZOMBIE_MIN_AREA = 400  # px of grey per zombie; potato mine stalks and pea splats stay below
+CLIPPED_MIN_AREA = 250  # a row-0 zombie's head is over the seed bar: only its lower part is measured
 ZOMBIE_MAX_W = 140  # wider grey areas are dialogs or the stone edge, not a zombie
+ZOMBIE_MAX_H = 120  # head + shirt + legs of one zombie
+BANNER_MAX_V = 125  # median brightness of a pixel line under a tutorial banner: 74-102 (open grass: 147-187)
+BANNER_MIN_Y = 300  # tutorial banners appear around y 470-570
 STACK_GAP = 30  # px between head+shirt and legs that still count as one zombie
+ENTERING_COL = 8  # from here right, zombies may be beyond what measure_zombies looks at (x >= 755)
 
 
 def measure_zombies(image: np.ndarray, n_rows: int) -> list[tuple[int, int]]:
@@ -158,13 +163,25 @@ def measure_zombies(image: np.ndarray, n_rows: int) -> list[tuple[int, int]]:
     read as 3 and 4); columns it mostly got right. Code measures instead: zombie skin and shirt are
     the only large unsaturated grey areas on day grass (plants, suns, cards and mowers are
     saturated). That grey part is head + shirt; its centre stands ~85 px above the feet, and feet
-    stand ~40 px above the bottom of their row, which leaves ~35 px of margin each way. Checked on
-    16 frames of that run (docs/env.md). Zombies dimmed by a tutorial banner or still off the lawn
-    are missed; look() keeps the model's reading for rows code saw nothing in.
+    stand ~40 px above the bottom of their row, which leaves ~35 px of margin each way.
+
+    A row-0 zombie's head is over the seed bar, so a blob cut off there needs less area. Nothing is
+    measured while the game's slate pause or menu dialog covers the lawn (its icon is a zombie), and
+    pixel lines darkened by a tutorial banner are skipped (its lettering has grey edges). Checked
+    on all 294 frames of the two real runs of 2026-10-29 (docs/env.md). Zombies under a banner or
+    still off the lawn are missed; place_zombies keeps the model's reading for entering ones.
     """
     y0, h = geometry.LAWNS[n_rows]
+    b, g, r = image[200:380, 260:540].reshape(-1, 3).mean(0)
+    if g < 90 and b > g:  # the game's slate pause / menu dialog covers the lawn; its icon is a zombie
+        return []
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     mask = ((hsv[..., 1] < 70) & (hsv[..., 2] > 50) & (hsv[..., 2] < 230)).astype(np.uint8)
+    # A tutorial banner darkens a full-width band and its lettering is grey-edged: skip those lines.
+    banner = np.median(hsv[:, geometry.LAWN_X0:755, 2], axis=1) < BANNER_MAX_V
+    banner = np.convolve(banner, np.ones(17), mode="same") > 0  # and its soft edges
+    banner[:BANNER_MIN_Y] = False  # banners sit low; the darker lawn top edge is not one
+    mask[banner] = 0
     mask[:y0 + 5] = 0
     mask[y0 + n_rows * h - 10:] = 0  # the stone edge below the lawn is grey too
     mask[:, :geometry.LAWN_X0] = 0  # mowers, house
@@ -172,23 +189,26 @@ def measure_zombies(image: np.ndarray, n_rows: int) -> list[tuple[int, int]]:
     mask[570:, 500:] = 0  # level progress bar
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
     count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
-    boxes = [[int(v) for v in stats[i]] for i in range(1, count) if stats[i][cv2.CC_STAT_AREA] >= 150]
+    boxes = [[int(v) for v in stats[i]] for i in range(1, count) if stats[i][cv2.CC_STAT_AREA] >= 40]
     merged = True
     while merged:  # one zombie can fall apart into head + shirt and legs
         merged = False
         for i, j in ((i, j) for i in range(len(boxes)) for j in range(i + 1, len(boxes))):
             a, b = boxes[i], boxes[j]
             x_overlap = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]) > -10
-            if x_overlap and max(a[1], b[1]) - min(a[1] + a[3], b[1] + b[3]) < STACK_GAP:
-                x0, top = min(a[0], b[0]), min(a[1], b[1])
-                x1, bottom = max(a[0] + a[2], b[0] + b[2]), max(a[1] + a[3], b[1] + b[3])
+            x0, top = min(a[0], b[0]), min(a[1], b[1])
+            x1, bottom = max(a[0] + a[2], b[0] + b[2]), max(a[1] + a[3], b[1] + b[3])
+            # Never taller or wider than one zombie: two zombies in adjacent rows stand close too.
+            one_zombie = bottom - top <= ZOMBIE_MAX_H and x1 - x0 <= ZOMBIE_MAX_W
+            if x_overlap and one_zombie and max(a[1], b[1]) - min(a[1] + a[3], b[1] + b[3]) < STACK_GAP:
                 boxes[i] = [x0, top, x1 - x0, bottom - top, a[4] + b[4]]
                 del boxes[j]
                 merged = True
                 break
     found = []
     for x, y, w, bh, area in boxes:
-        if area < ZOMBIE_MIN_AREA or bh < 40 or w > ZOMBIE_MAX_W:
+        clipped = y <= y0 + 10  # cut off by the seed bar (2026-10-29 run, frame 2574: missed otherwise)
+        if area < (CLIPPED_MIN_AREA if clipped else ZOMBIE_MIN_AREA) or bh < (30 if clipped else 40) or w > ZOMBIE_MAX_W:
             continue
         row = min(n_rows - 1, max(0, (y + bh // 2 + 45 - y0) // h))
         col = min(9, max(0, (x - geometry.LAWN_X0) // geometry.CELL_W))
@@ -199,10 +219,11 @@ def measure_zombies(image: np.ndarray, n_rows: int) -> list[tuple[int, int]]:
 def place_zombies(rows: list[RowReport], measured: list[tuple[int, int]]) -> tuple[list[Zombie], dict[int, int]]:
     """Positions from code, types from the model. Each measured row takes the model's types from the
     same row, else from a neighbouring row (the model's usual error is one row), else "unknown".
-    A row the model reported that no measured zombie took is kept as the model said only while the
-    model counted more zombies than code found: code misses zombies under a banner or still off
-    the lawn, but a leftover row is usually the same zombie reported rows away (f66: two zombies
-    in rows 1 and 2 read as rows 3 and 4)."""
+    A row the model reported that no measured zombie took is kept as the model said only where code
+    cannot see (column 8 or beyond, still entering) and while the model counted more zombies than
+    code found. Elsewhere a leftover is a misread or invented: f66 of the first run had two zombies
+    in rows 1 and 2 read as rows 3 and 4; the second run's frame 164 had five "zombonis" at column 0
+    on an empty lawn. (A zombie dimmed by a tutorial banner is lost this way; that is rarer.)"""
     by_row: dict[int, list[int]] = {}
     for r, c in measured:
         by_row.setdefault(r, []).append(c)
@@ -220,7 +241,8 @@ def place_zombies(rows: list[RowReport], measured: list[tuple[int, int]]) -> tup
         zombies += [Zombie(type=t, row=r) for t in types[len(cols):]]
         nearest[r] = min(cols)
     unaccounted = sum(len(row.zombies) for row in rows) - len(measured)
-    leftover = [r for r, row in enumerate(rows) if row.zombies and r not in taken and r not in by_row]
+    leftover = [r for r, row in enumerate(rows) if row.zombies and r not in taken and r not in by_row
+                and (row.nearest_col is None or row.nearest_col >= ENTERING_COL)]
     for r in sorted(leftover, key=lambda r: rows[r].nearest_col if rows[r].nearest_col is not None else 9):
         if unaccounted <= 0:
             break
