@@ -41,7 +41,7 @@ class Settings:
     plants_interval: float  # split mode: seconds between reads of the plants on the lawn
     qwen_url: str
     qwen_model: str
-    decider: str  # "rules" (tactics only) | "onejev" (tactics + OneJev yes/no judgments)
+    decider: str  # "rules" (explicit baseline) | "onejev" (model chooses plant, row, column or wait)
     onejev_url: str
     onejev_model: str
     decider_timeout: float

@@ -1,4 +1,8 @@
-"""Jev: the fast decider, about once a second, in three layers.
+"""Legacy tactical baseline, used only by explicit PVZ_DECIDER=rules.
+
+The live model selector is server.action_selector.OneJevSelector. The following
+historical rules remain for baseline comparisons and old playbook compatibility;
+they do not choose actions in OneJev mode. plan_next is always None in live use.
 
 1. judgments (model): OneJev answers one fuzzy yes/no question per row with zombies: is any of
    them tough for ordinary peashooters? Its state is facts only, no rule text: given rule text,
@@ -15,24 +19,14 @@ Must never import server.judge or read StateMsg (tests/test_isolation.py).
 
 from __future__ import annotations
 
-import logging
-import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
-
-import httpx
 
 from rules import hard_rules
 from rules.playbook_rules import JevPolicy
 from server import geometry
 from server.planner import Placement
 from server.scene import Scene
-
-if TYPE_CHECKING:
-    from server.config import Settings
-
-log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -78,17 +72,6 @@ class Judgments:
         return self.tough.get(row, 0.0) >= 0.5
 
 
-class Judge(Protocol):
-    async def judge(self, ctx: JevContext, policy: JevPolicy) -> Judgments: ...
-
-
-class NoJudge:
-    """No model: no row is judged tough, so only the plain thresholds apply."""
-
-    async def judge(self, ctx: JevContext, policy: JevPolicy) -> Judgments:
-        return Judgments()
-
-
 def facts(scene: Scene, planted: dict[tuple[int, int], list[str]]) -> str:
     """Facts only (no rules, no thresholds): what is on the lawn and what the agent placed."""
     lines = [f"Lawn: {scene.lawn or 'unknown'}, {scene.rows or '?'} rows, 9 columns "
@@ -101,41 +84,6 @@ def facts(scene: Scene, planted: dict[tuple[int, int], list[str]]) -> str:
             lines.append(f"Row {row}: zombies {', '.join(types) or 'none'}{where}; "
                          f"plants {', '.join(mine) or 'none'}.")
     return "\n".join(lines)
-
-
-class OneJevJudge:
-    def __init__(self, url: str, model: str, timeout: float, client: httpx.AsyncClient | None = None) -> None:
-        self.url, self.model = url, model
-        self.client = client or httpx.AsyncClient(timeout=timeout)
-
-    async def judge(self, ctx: JevContext, policy: JevPolicy) -> Judgments:
-        rows = sorted({z.row for z in ctx.scene.zombies if z.type != "unknown"})
-        if not rows:
-            return Judgments(source="onejev")
-        start = time.monotonic()
-        questions = {
-            f"tough_row_{r}": {"type": "noul", "instructions": policy.tough_question.format(
-                types=", ".join(z.type for z in ctx.scene.zombies if z.row == r))}
-            for r in rows
-        }
-        try:
-            response = await self.client.post(self.url, json={
-                "model": self.model, "state": facts(ctx.scene, ctx.planted), "questions": questions})
-            response.raise_for_status()
-            answers = response.json()["answers"]
-            tough = {r: float(answers[f"tough_row_{r}"]["noul"]) for r in rows}
-        except httpx.HTTPStatusError as e:
-            return self._failed(start, f"HTTP {e.response.status_code}: {e.response.text[:200]}")
-        except httpx.HTTPError as e:
-            return self._failed(start, f"{type(e).__name__}: {e}")
-        except (KeyError, TypeError, ValueError) as e:
-            return self._failed(start, f"bad response: {e!r}")
-        return Judgments(tough=tough, source="onejev", latency=time.monotonic() - start)
-
-    @staticmethod
-    def _failed(start: float, error: str) -> Judgments:
-        log.warning("Jev judgment failed, no row counts as tough: %s", error)
-        return Judgments(source="failed", latency=time.monotonic() - start, error=error)
 
 
 # ---- layer 2: tactics ----
@@ -272,11 +220,3 @@ def choose(ctx: JevContext, policy: JevPolicy, j: Judgments) -> tuple[str, str, 
             return action, why + (f" (skipped, no placement: {', '.join(skipped)})" if skipped else ""), place
         skipped.append(action)
     return "wait", "nothing else applies", None
-
-
-def make_judge(s: Settings) -> Judge:
-    if s.decider == "onejev":
-        return OneJevJudge(s.onejev_url, s.onejev_model, timeout=s.decider_timeout)
-    if s.decider == "rules":
-        return NoJudge()
-    raise ValueError(f"unknown decider: {s.decider}")

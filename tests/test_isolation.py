@@ -4,7 +4,7 @@ import ast
 from pathlib import Path
 
 PLAYER_MODULES = ["server/perception.py", "server/policy.py", "server/planner.py", "server/decider.py",
-                  "server/scene.py"]
+                  "server/scene.py", "server/action_selector.py"]
 FORBIDDEN = {"server.judge", "StateMsg"}
 ROOT = Path(__file__).resolve().parent.parent
 

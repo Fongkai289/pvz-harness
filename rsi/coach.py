@@ -88,16 +88,15 @@ def player_profile(s: Settings) -> dict[str, Any]:
     planner_model = {"qwen": s.qwen_model, "claude": s.planner_model}.get(s.planner, s.planner)
     return {
         "planner": {"model": planner_model, "every_seconds": s.plan_interval,
-                    "input": "screenshot" if s.planner_send_image else "perception summary text only"},
+                    "input": "screenshot" if s.planner_send_image else "perception summary text only",
+                    "output": "stage objective, priorities, row guidance, reserve and total budget; no placements"},
         "jev": {"every_seconds": s.fast_interval,
-                "tactics": ("playbook jev section: the first action in `priorities` that applies and can be placed "
-                            "now; which card (role lists, in order), which row and which column (the *_cols, "
-                            "offsets and wall_* fields) also come from that section"),
-                "judgment_model": s.onejev_model if s.decider == "onejev" else None,
-                "judgment": "yes/no per row with zombies: is any of them tough (playbook jev.tough_question)",
+                "selection_model": s.onejev_model if s.decider == "onejev" else None,
+                "selection": "model ranks admissible plant/row options then columns, or chooses wait",
+                "tactics": "playbook jev section affects only the explicit rules baseline, not OneJev mode",
                 "hard_rules": "fixed, not editable: cell free and on the lawn, card usable and not just used, "
                               "enough sun, instant kills only within 1 column of a zombie"},
-        "look_step": {"every_seconds": s.look_interval if s.planner_mode == "split" else None,
+        "look_step": {"every_seconds": s.look_interval if s.planner == "qwen" else None,
                       "code_reads": "card usable or not, lawn type",
                       "model_reads": "sun number, zombie types and nearest column per row"},
         "loadout": s.loadout,
