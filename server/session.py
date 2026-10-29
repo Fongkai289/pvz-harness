@@ -192,8 +192,8 @@ class Session:
             self.policy.drop_next()
             return place if place is None or (place.row, place.col) not in lawn else None
         self.policy.set_rows(scene.rows or 5)
-        ctx = JevContext(scene=scene, plan_next=self.policy.next_placement(),
-                         planted=lawn, used_slots=self.used_slots)
+        ctx = JevContext(scene=scene, plan_next=self.policy.next_placement(), planted=lawn, used_slots=self.used_slots,
+                         check=lambda p: hard_rules.check(p, scene, lawn, self.used_slots, self.sun_spent))
         judgments = await self.jev_judge.judge(ctx, self.playbook.jev)  # layer 1: model, yes/no only
         action, reason, place = choose(ctx, self.playbook.jev, judgments)  # layer 2: playbook tactics
         if action == "follow_plan":
