@@ -4,7 +4,8 @@ With game state, seeing is free and exact. From pixels it is its own problem, so
 step with its own output, which the judge can check against ground truth:
 
 - code reads what can be measured exactly: whether each seed card is usable (brightness) and the
-  lawn type (water / darkness / green), which also fixes the number of rows
+  lawn type (water / darkness / green), which also fixes the number of rows; on day lawns also
+  where the zombies stand (row and front column), see measure_zombies
 - the vision model reads what needs understanding: the sun number (from an enlarged crop of the
   top bar) and zombie types per row, from a named list with appearance hints, "unknown" allowed
 
@@ -111,6 +112,7 @@ class Scene(BaseModel):
     cards: list[Card]
     zombies: list[Zombie]
     nearest_col: dict[int, int] = {}  # row -> column of its zombie closest to the house
+    positions: str = "model"  # who placed the zombies: "model" (rows as the model said) or "code"
     other: str = ""
 
     def describe(self) -> str:
@@ -142,6 +144,91 @@ def read_cards(image: np.ndarray, loadout: list[str]) -> list[Card]:
         v = float(hsv[geometry.SEED_PICTURE_Y0:geometry.SEED_PICTURE_Y1, x0 + 4:x1 - 4, 2].mean())
         cards.append(Card(slot=slot, plant=plant, ready=v >= CARD_READY_MIN_V, brightness=round(v, 1)))
     return cards
+
+
+ZOMBIE_MIN_AREA = 400  # px of grey per zombie; potato mine stalks and pea splats stay below
+ZOMBIE_MAX_W = 140  # wider grey areas are dialogs or the stone edge, not a zombie
+STACK_GAP = 30  # px between head+shirt and legs that still count as one zombie
+
+
+def measure_zombies(image: np.ndarray, n_rows: int) -> list[tuple[int, int]]:
+    """(row, front column) of each zombie on a day lawn, nearest the house first.
+
+    On the real day lawn the model put zombies one or more rows off (2026-10-29 run: rows 1 and 2
+    read as 3 and 4); columns it mostly got right. Code measures instead: zombie skin and shirt are
+    the only large unsaturated grey areas on day grass (plants, suns, cards and mowers are
+    saturated). That grey part is head + shirt; its centre stands ~85 px above the feet, and feet
+    stand ~40 px above the bottom of their row, which leaves ~35 px of margin each way. Checked on
+    16 frames of that run (docs/env.md). Zombies dimmed by a tutorial banner or still off the lawn
+    are missed; look() keeps the model's reading for rows code saw nothing in.
+    """
+    y0, h = geometry.LAWNS[n_rows]
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    mask = ((hsv[..., 1] < 70) & (hsv[..., 2] > 50) & (hsv[..., 2] < 230)).astype(np.uint8)
+    mask[:y0 + 5] = 0
+    mask[y0 + n_rows * h - 10:] = 0  # the stone edge below the lawn is grey too
+    mask[:, :geometry.LAWN_X0] = 0  # mowers, house
+    mask[:, 755:] = 0  # stone path right of the lawn
+    mask[570:, 500:] = 0  # level progress bar
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask)
+    boxes = [[int(v) for v in stats[i]] for i in range(1, count) if stats[i][cv2.CC_STAT_AREA] >= 150]
+    merged = True
+    while merged:  # one zombie can fall apart into head + shirt and legs
+        merged = False
+        for i, j in ((i, j) for i in range(len(boxes)) for j in range(i + 1, len(boxes))):
+            a, b = boxes[i], boxes[j]
+            x_overlap = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0]) > -10
+            if x_overlap and max(a[1], b[1]) - min(a[1] + a[3], b[1] + b[3]) < STACK_GAP:
+                x0, top = min(a[0], b[0]), min(a[1], b[1])
+                x1, bottom = max(a[0] + a[2], b[0] + b[2]), max(a[1] + a[3], b[1] + b[3])
+                boxes[i] = [x0, top, x1 - x0, bottom - top, a[4] + b[4]]
+                del boxes[j]
+                merged = True
+                break
+    found = []
+    for x, y, w, bh, area in boxes:
+        if area < ZOMBIE_MIN_AREA or bh < 40 or w > ZOMBIE_MAX_W:
+            continue
+        row = min(n_rows - 1, max(0, (y + bh // 2 + 45 - y0) // h))
+        col = min(9, max(0, (x - geometry.LAWN_X0) // geometry.CELL_W))
+        found.append((row, col))
+    return sorted(found, key=lambda rc: rc[1])
+
+
+def place_zombies(rows: list[RowReport], measured: list[tuple[int, int]]) -> tuple[list[Zombie], dict[int, int]]:
+    """Positions from code, types from the model. Each measured row takes the model's types from the
+    same row, else from a neighbouring row (the model's usual error is one row), else "unknown".
+    A row the model reported that no measured zombie took is kept as the model said only while the
+    model counted more zombies than code found: code misses zombies under a banner or still off
+    the lawn, but a leftover row is usually the same zombie reported rows away (f66: two zombies
+    in rows 1 and 2 read as rows 3 and 4)."""
+    by_row: dict[int, list[int]] = {}
+    for r, c in measured:
+        by_row.setdefault(r, []).append(c)
+    taken: set[int] = set()
+    zombies: list[Zombie] = []
+    nearest: dict[int, int] = {}
+    for r, cols in sorted(by_row.items(), key=lambda kv: min(kv[1])):
+        source = next((s for s in (r, r - 1, r + 1)
+                       if 0 <= s < len(rows) and s not in taken and rows[s].zombies), None)
+        types: list[str] = list(rows[source].zombies) if source is not None else []
+        if source is not None:
+            taken.add(source)
+        for i, c in enumerate(sorted(cols)):
+            zombies.append(Zombie(type=types[i] if i < len(types) else "unknown", row=r, col=c))
+        zombies += [Zombie(type=t, row=r) for t in types[len(cols):]]
+        nearest[r] = min(cols)
+    unaccounted = sum(len(row.zombies) for row in rows) - len(measured)
+    leftover = [r for r, row in enumerate(rows) if row.zombies and r not in taken and r not in by_row]
+    for r in sorted(leftover, key=lambda r: rows[r].nearest_col if rows[r].nearest_col is not None else 9):
+        if unaccounted <= 0:
+            break
+        zombies += [Zombie(type=t, row=r) for t in rows[r].zombies]
+        unaccounted -= len(rows[r].zombies)
+        if rows[r].nearest_col is not None:
+            nearest[r] = min(max(rows[r].nearest_col, 0), 9)
+    return zombies, nearest
 
 
 def look_prompt(n_rows: int) -> str:
@@ -301,11 +388,17 @@ class QwenLooker:
         except (KeyError, IndexError, ValidationError) as e:
             return LookResult(None, time.monotonic() - start, f"bad response: {e}")
         rows = report.rows[:n_rows]
-        zombies = [Zombie(type=t, row=r) for r, row in enumerate(rows) for t in row.zombies]
-        nearest = {r: min(max(row.nearest_col, 0), 9) for r, row in enumerate(rows)
-                   if row.zombies and row.nearest_col is not None}
+        if lawn == "day":  # grey zombies on green grass: code measures where they stand
+            zombies, nearest = place_zombies(rows, measure_zombies(image, n_rows))
+            positions = "code"
+        else:  # night graves, roof tiles and water are grey or blue too; not checked yet
+            zombies = [Zombie(type=t, row=r) for r, row in enumerate(rows) for t in row.zombies]
+            nearest = {r: min(max(row.nearest_col, 0), 9) for r, row in enumerate(rows)
+                       if row.zombies and row.nearest_col is not None}
+            positions = "model"
         scene = Scene(frame_id=frame_id, t_capture=t_capture, lawn=lawn, rows=n_rows, sun=report.sun,
-                      cards=read_cards(image, loadout), zombies=zombies, nearest_col=nearest, other=report.other)
+                      cards=read_cards(image, loadout), zombies=zombies, nearest_col=nearest,
+                      positions=positions, other=report.other)
         usage = payload.get("usage") or {}
         return LookResult(scene, time.monotonic() - start, None, usage.get("prompt_tokens", 0),
                           usage.get("completion_tokens", 0))
