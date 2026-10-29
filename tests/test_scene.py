@@ -1,13 +1,17 @@
 import asyncio
 import json
+from pathlib import Path
 
+import cv2
 import httpx
 import numpy as np
 
 from server import geometry
 from server.planner import DECIDE_CONTRACT, QwenPlanner
-from server.scene import Card, Scene, Zombie, read_cards
+from server.scene import Card, RowReport, Scene, Zombie, measure_zombies, place_zombies, read_cards
 from rsi.vision_eval import score_plants, score_scene
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def test_score_plants():
@@ -28,6 +32,28 @@ def test_read_cards_uses_brightness():
         image[y0:y1, x0:x1] = value
     cards = read_cards(image, ["peashooter", "sunflower"])
     assert [c.ready for c in cards] == [True, False]
+
+
+def test_measure_zombies_on_real_day_frames():
+    # Frames of the first real run (2026-10-29, level 1-6); positions checked by eye.
+    frame = lambda n: cv2.imread(str(FIXTURES / f"day_1-6_f{n:04d}.jpg"))
+    assert measure_zombies(frame(73), 5) == [(2, 3), (1, 7)]  # the model said rows 3 and 4
+    assert measure_zombies(frame(405), 5) == [(2, 0), (1, 3), (4, 8)]
+    assert measure_zombies(frame(1022), 5) == [(4, 2), (3, 6)]  # coneheads; wall-nut, mines ignored
+
+
+def test_place_zombies_takes_rows_from_code_and_types_from_the_model():
+    rows = lambda *reports: [RowReport(zombies=z, nearest_col=c) for z, c in reports]
+    empty = ([], None)
+    # Off by one: the model's types move to the measured row.
+    zs, nearest = place_zombies(rows(empty, (["conehead"], 3), empty, empty, empty), [(2, 3)])
+    assert [(z.type, z.row, z.col) for z in zs] == [("conehead", 2, 3)] and nearest == {2: 3}
+    # Off by more (f66): two zombies measured, two reported far away; no phantom row is left.
+    zs, nearest = place_zombies(rows(empty, empty, empty, (["normal"], 3), (["normal"], 7)), [(2, 3), (1, 7)])
+    assert sorted((z.row, z.col) for z in zs) == [(1, 7), (2, 3)] and nearest == {1: 7, 2: 3}
+    # Code missed one (under a banner): the model's extra zombie is kept where it said.
+    zs, nearest = place_zombies(rows(empty, (["normal"], 0), empty, empty, (["conehead"], 5)), [(1, 0)])
+    assert nearest == {1: 0, 4: 5} and {z.type for z in zs} == {"normal", "conehead"}
 
 
 def test_classify_lawn_from_colour():
