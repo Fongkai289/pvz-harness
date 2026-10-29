@@ -271,13 +271,37 @@ OTHER_PLANT = "other plant"
 
 
 def plants_prompt(n_rows: int, names: list[str]) -> str:
+    codes = ", ".join(f"{i + 1} = {n}" for i, n in enumerate(names))
     return (
-        f"This is a Plants vs. Zombies screenshot. The lawn has {n_rows} rows and 9 columns; row numbers are "
-        "written at the left and column numbers along the top of the lawn. For each row, top to bottom, list the plants standing on the lawn with their column. "
-        f"Use only these names: {', '.join(names)}. A plant on a lily pad or flower pot is listed as both. Include "
-        "plants partly hidden by zombies or suns, and small ones such as potato mines. Ignore zombies, projectiles, "
-        "suns and the seed bar at the top. Answer with compact JSON only."
+        f"The image shows the {n_rows * geometry.COLS} cells of a Plants vs. Zombies lawn cut apart, one tile per "
+        f"cell, each labelled \"row,col\" in its corner, laid out {n_rows} rows by {geometry.COLS} columns. For each "
+        "tile give the plant standing in it as a number: 0 = empty (grass, dirt or water, also when only a zombie, "
+        f"sun, lawnmower or seed packet is there), {codes}. Include plants partly hidden by zombies or suns, and "
+        "small ones such as potato mines. Answer with rows top to bottom, 9 numbers each, in tile order, compact "
+        "JSON only."
     )
+
+
+def plant_mosaic(image: np.ndarray, n_rows: int) -> np.ndarray:
+    """The lawn's cells cut apart by code, enlarged 1.5x, separated and labelled "row,col".
+
+    Where a plant stands is fixed by the tile, so the model only says what is in it. On 12 labelled real
+    frames (2026-10-29) this found 107/107 plants with 106 types right and nothing invented, against
+    85/107 with 19 invented cells for the gridded screenshot with a sparse list (whole rows read one
+    column off) and 99/107 with 6 invented for the gridded screenshot with a matrix; ~2.5 s per call.
+    """
+    y0, h = geometry.LAWNS[n_rows]
+    tw, th, gap = int(geometry.CELL_W * 1.5), int(h * 1.5), 10
+    out = np.full((n_rows * (th + gap) + gap, geometry.COLS * (tw + gap) + gap, 3), 30, np.uint8)
+    for r in range(n_rows):
+        for c in range(geometry.COLS):
+            x, y = geometry.LAWN_X0 + c * geometry.CELL_W, y0 + r * h
+            tile = cv2.resize(image[y:y + h, x:x + geometry.CELL_W], (tw, th), interpolation=cv2.INTER_CUBIC)
+            cv2.rectangle(tile, (0, 0), (46, 24), (0, 0, 0), -1)
+            cv2.putText(tile, f"{r},{c}", (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            ox, oy = gap + c * (tw + gap), gap + r * (th + gap)
+            out[oy:oy + th, ox:ox + tw] = tile
+    return out
 
 
 @dataclass
@@ -336,41 +360,39 @@ class QwenLooker:
         self.client = client or httpx.AsyncClient(timeout=timeout)
 
     async def look_plants(self, image: np.ndarray, loadout: list[str]) -> PlantsResult:
-        """Plants on the lawn. Its own call, so the slower plant read never delays the zombie read.
+        """Plants on the lawn, one code per cell from a mosaic of the cells (see plant_mosaic). Its own
+        call, so the slower plant read never delays the zombie read.
 
-        Names are limited to the agent's loadout plus "other plant". On the day screenshot of
-        eval/vision_labels.json this found 14/18 plants with nothing invented; it missed plants
-        covered by a zombie or a falling sun, and two potato mines (2026-10-28).
+        Names are limited to the agent's loadout plus "other plant". One plant per cell: on a lily pad
+        or flower pot only the top plant is reported (pool and roof are not checked yet).
         """
         start = time.monotonic()
         n_rows = 6 if classify_lawn(image) in ("pool", "fog") else 5
         names = sorted(set(loadout) - {"?"}) + [OTHER_PLANT]
-        schema = {"type": "object", "required": ["rows"], "properties": {"rows": {"type": "array", "items": {
-            "type": "array", "items": {"type": "object", "required": ["col", "plant"], "properties": {
-                "col": {"type": "integer", "minimum": 0, "maximum": 8},
-                "plant": {"type": "string", "enum": names}}}}}}}
+        row = {"type": "array", "minItems": geometry.COLS, "maxItems": geometry.COLS,
+               "items": {"type": "integer", "minimum": 0, "maximum": len(names)}}
+        schema = {"type": "object", "required": ["rows"], "properties": {
+            "rows": {"type": "array", "minItems": n_rows, "maxItems": n_rows, "items": row}}}
         body = {
             "model": self.model,
-            "max_tokens": 1200,
+            "max_tokens": 600,
             "temperature": 0,
             "chat_template_kwargs": {"enable_thinking": False},
             "messages": [{"role": "user", "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(with_grid(image, n_rows))}"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(plant_mosaic(image, n_rows))}"}},
                 {"type": "text", "text": plants_prompt(n_rows, names)},
             ]}],
-            "response_format": {"type": "json_schema", "json_schema": {"name": "plants", "schema": schema}},
+            "response_format": {"type": "json_schema", "json_schema": {"name": "plant_matrix", "schema": schema}},
         }
         try:
             response = await self.client.post(self.url, json=body)
             response.raise_for_status()
             payload = response.json()
             rows = json.loads(payload["choices"][0]["message"]["content"])["rows"]
-            grid: dict[tuple[int, int], list[str]] = {}
-            for r, row in enumerate(rows[:n_rows]):
-                for p in row:
-                    cell = grid.setdefault((r, int(p["col"])), [])
-                    if p["plant"] not in cell:
-                        cell.append(p["plant"])
+            grid: dict[tuple[int, int], list[str]] = {
+                (r, c): [names[code - 1]]
+                for r, codes in enumerate(rows[:n_rows]) for c, code in enumerate(codes[:geometry.COLS])
+                if 0 < int(code) <= len(names)}
         except httpx.HTTPStatusError as e:
             return PlantsResult(None, time.monotonic() - start, f"HTTP {e.response.status_code}: {e.response.text[:200]}")
         except httpx.HTTPError as e:
