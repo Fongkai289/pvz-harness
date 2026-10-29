@@ -1,0 +1,8 @@
+# Shell scripts run on the Linux server: keep LF on checkout even on Windows.
+*.sh text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.png binary
+*.jpg binary

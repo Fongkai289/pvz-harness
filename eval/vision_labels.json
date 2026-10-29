@@ -1,0 +1,115 @@
+{
+  "_about": "Ground truth for the look step, read by a person from official Steam screenshots of PvZ GOTY (store_item_assets/steam/apps/3590/00000081xx.1920x1080.jpg, 1440x1080 = 1.8x the game). Images live on the server in data/vision_eval/, not in the repo. occluded = card slots covered by a zombie, not scored. plants: only labelled where marked; cell 'row,col' -> plant, names from that image's loadout, anything else is 'other plant'. Labelled 2026-10-28 from the full-size image.",
+  "images": [
+    {
+      "file": "steam_8164.jpg",
+      "level": "1-7",
+      "lawn": "day",
+      "sun": 650,
+      "slots": 6,
+      "greyed": [
+        4
+      ],
+      "occluded": [],
+      "zombie_types": [
+        "normal",
+        "flag",
+        "conehead",
+        "pole vaulting"
+      ],
+      "loadout": [
+        "peashooter",
+        "sunflower",
+        "cherry bomb",
+        "wall-nut",
+        "potato mine",
+        "snow pea"
+      ],
+      "plants": {
+        "0,0": "sunflower",
+        "0,1": "sunflower",
+        "0,2": "peashooter",
+        "0,5": "wall-nut",
+        "1,0": "peashooter",
+        "1,1": "sunflower",
+        "1,2": "sunflower",
+        "1,4": "potato mine",
+        "2,0": "peashooter",
+        "2,1": "other plant",
+        "2,2": "sunflower",
+        "2,3": "potato mine",
+        "3,0": "sunflower",
+        "3,1": "peashooter",
+        "3,2": "sunflower",
+        "3,3": "snow pea",
+        "4,1": "peashooter",
+        "4,2": "peashooter"
+      }
+    },
+    {
+      "file": "steam_8160.jpg",
+      "level": "2-7",
+      "lawn": "night",
+      "sun": 260,
+      "slots": 7,
+      "greyed": [
+        6
+      ],
+      "occluded": [
+        4
+      ],
+      "zombie_types": [
+        "normal",
+        "conehead",
+        "screen door",
+        "football"
+      ]
+    },
+    {
+      "file": "steam_8156.jpg",
+      "level": "3-4",
+      "lawn": "pool",
+      "sun": 75,
+      "slots": 7,
+      "greyed": [
+        3,
+        4,
+        6
+      ],
+      "occluded": [],
+      "zombie_types": [
+        "normal",
+        "conehead",
+        "buckethead",
+        "ducky tube",
+        "newspaper",
+        "snorkel",
+        "pole vaulting"
+      ]
+    },
+    {
+      "file": "steam_8157.jpg",
+      "level": "3-9",
+      "lawn": "pool",
+      "sun": 175,
+      "slots": 7,
+      "greyed": [
+        3
+      ],
+      "occluded": [
+        5,
+        6
+      ],
+      "zombie_types": [
+        "normal",
+        "flag",
+        "conehead",
+        "buckethead",
+        "ducky tube",
+        "pole vaulting",
+        "snorkel",
+        "zomboni"
+      ]
+    }
+  ]
+}
