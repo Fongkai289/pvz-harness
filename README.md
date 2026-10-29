@@ -61,10 +61,38 @@ disk that can be lost if the container is rebuilt, so copy `runs/` back regularl
 
 ## Code research and native-emulator learning
 
-The new `rsi.code_loop` lets a coach discover failures from completed development
-games and rewrite **Python perception and decision/reflex functions**. This is
-code evolution, not model-weight training. The old parameter-only loop below
-remains available.
+The new `rsi.code_loop` separates **coach, engineer and judge**. The coach discovers
+failures from completed development games and returns an evidence-backed task,
+not code. An independent engineer investigates source and logs, edits player
+modules, runs development tests and repairs failures. The fixed judge decides
+whether to promote the resulting candidate. This is code evolution, not
+model-weight training. The old parameter-only loop below remains available.
+
+Coach and engineer use separate Qwen contexts and prompts on the existing server
+model pool; no additional model deployment is needed. The engineer may challenge
+the coach's diagnosis. Its tools are `list_files`, `read_file`, `write_file`,
+`check`, `test_candidate` and `finish`. Each round permits one coach request,
+up to twelve engineer requests and two engineer development evaluations, followed
+by the independent promotion stages. Engineer tests use the current development
+seeds; no confirmation/audit records are visible to either role.
+
+The engineer works in a private copy of five modules: `player/perception.py`,
+`player/state.py`, `player/actions.py`, `player/policy.py` and `player/tools.py`.
+These are virtual candidate paths, not the live server's files. Modules share
+a restricted function namespace without imports. The engineer can add and change
+pixel-processing tools, observation/memory processing and action construction,
+using the fixed pixel primitives. It can read those primitives' source and the
+renderer contract, but cannot edit the host primitive implementations, evaluator,
+model transport, simulator or real Windows client. This is a bounded player-tool
+engineer, not an unrestricted repository-maintenance agent.
+
+Every submission must have successfully completed a development test of its
+exact final source; a low score is allowed to reach the judge and be rejected.
+Edits after testing invalidate submission until retested. Validation/test errors
+return to the engineer for repair within its budget. Exhaustion or failure leaves
+the incumbent in place. Module boundaries are stored inside the immutable
+candidate source, so subsequent rounds inherit the promoted tools as well as the
+policy. Legacy single-file candidates are split mechanically without policy changes.
 
 The native engine is [dnartz/PvZ-Emulator](https://github.com/dnartz/PvZ-Emulator),
 pinned to `bb6347233fbbf9964fa6dd4a15f721262eda15ce`. The installer applies an
@@ -139,6 +167,11 @@ controls apply to the research loop, not the existing Windows game control panel
 
 Each run saves `experiment.json`, complete episode reports, proposal source and
 rationale, model-call latency/usage, `status.json`, and append-only ledger events.
+`roles/<id>/` saves the coach task, separate role requests/responses (including
+HTTP errors), engineer tool actions/results, before/work module copies, candidate
+diff and manifest. Status distinguishes `coaching`, `engineering`,
+`engineer_testing` and judge evaluations. Internally generated candidates have
+origin `qwen-engineer`; recorded external proposals retain their supplied origin.
 `LATEST_RUN.json` identifies the latest run. To reproduce an external coach's
 proposal without making model requests, use `--rounds 1 --candidate-json FILE
 --candidate-origin NAME`; FILE follows `CodeProposal` in `rsi/code_coach.py`.
