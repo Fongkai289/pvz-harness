@@ -40,6 +40,10 @@ def test_measure_zombies_on_real_day_frames():
     assert measure_zombies(frame(73), 5) == [(2, 3), (1, 7)]  # the model said rows 3 and 4
     assert measure_zombies(frame(405), 5) == [(2, 0), (1, 3), (4, 8)]
     assert measure_zombies(frame(1022), 5) == [(4, 2), (3, 6)]  # coneheads; wall-nut, mines ignored
+    # A row-0 zombie's head is over the seed bar; only its lower part shows (second run, frame 2574).
+    assert (0, 3) in measure_zombies(cv2.imread(str(FIXTURES / "day_1-6_run2_f2574.jpg")), 5)
+    # The pause menu's newspaper zombie is not on the lawn.
+    assert measure_zombies(cv2.imread(str(FIXTURES / "day_1-6_paused.jpg")), 5) == []
 
 
 def test_place_zombies_takes_rows_from_code_and_types_from_the_model():
@@ -51,9 +55,12 @@ def test_place_zombies_takes_rows_from_code_and_types_from_the_model():
     # Off by more (f66): two zombies measured, two reported far away; no phantom row is left.
     zs, nearest = place_zombies(rows(empty, empty, empty, (["normal"], 3), (["normal"], 7)), [(2, 3), (1, 7)])
     assert sorted((z.row, z.col) for z in zs) == [(1, 7), (2, 3)] and nearest == {1: 7, 2: 3}
-    # Code missed one (under a banner): the model's extra zombie is kept where it said.
-    zs, nearest = place_zombies(rows(empty, (["normal"], 0), empty, empty, (["conehead"], 5)), [(1, 0)])
-    assert nearest == {1: 0, 4: 5} and {z.type for z in zs} == {"normal", "conehead"}
+    # Code cannot see one still entering: the model's extra zombie is kept where it said.
+    zs, nearest = place_zombies(rows(empty, (["normal"], 0), empty, empty, (["conehead"], 9)), [(1, 0)])
+    assert nearest == {1: 0, 4: 9} and {z.type for z in zs} == {"normal", "conehead"}
+    # Invented on an empty lawn (second run, frame 164: five "zombonis" at column 0): dropped.
+    zs, nearest = place_zombies(rows(*[(["zomboni"], 0)] * 5), [])
+    assert zs == [] and nearest == {}
 
 
 def test_classify_lawn_from_colour():
