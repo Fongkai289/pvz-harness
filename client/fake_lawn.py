@@ -122,6 +122,7 @@ class FakeLawn:
         self.recharge = {p: 0 for p in self.loadout}
         self.selected: int | None = None
         self.mowers = [True] * ROWS
+        self.mower_events = []
         self.outcome: str | None = None
         self.paused = False
         self.counters = {"spawned": 0, "killed": 0, "mowers_used": 0, "plants_placed": 0, "plants_eaten": 0,
@@ -218,6 +219,7 @@ class FakeLawn:
                 if self.mowers[z.row]:
                     self.mowers[z.row] = False
                     self.counters["mowers_used"] += 1
+                    self.mower_events.append(dict(row=z.row, time_s=self.step_n / 20, uncertainty_s=0.05))
                     for other in self.zombies:
                         if other.row == z.row:
                             other.hp = 0
@@ -273,6 +275,8 @@ class FakeLawn:
         with self._lock:
             return {**self.counters, "game": "lawn", "outcome": self.outcome, "step": self.step_n,
                     "sun": self.sun, "mowers_left": sum(self.mowers),
+                    "game_time_s": self.step_n / 20, "mower_timing_coverage": "from_start",
+                    "mower_events": [dict(e) for e in self.mower_events],
                     "scheduled": len(self.level.schedule),
                     "zombies": [{"type": z.kind, "row": z.row, "col": col_of(z.x)} for z in self.zombies],
                     "plants": {f"{p.row},{p.col}": p.kind for p in self.plants.values()}}

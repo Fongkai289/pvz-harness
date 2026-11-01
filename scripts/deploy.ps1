@@ -37,7 +37,8 @@ try {
     Invoke-Native "$env:SystemRoot\System32\tar.exe" @(
         "-czf", $tarball,
         "--exclude", "./.env", "--exclude", "./.venv", "--exclude", "./runs", "--exclude", "./logs",
-        "--exclude", "./data", "--exclude", "./.git", "--exclude", "./uv.lock", "--exclude", "./docs/screens",
+        "--exclude", "./data", "--exclude", "./.git", "--exclude", "./uv.lock", "--exclude", "./.cache",
+        "--exclude", "./.venv-sim",
         "--exclude", "__pycache__", "--exclude", ".pytest_cache",
         "-C", $root, ".")
     Write-Host ("tarball {0:N0} KB" -f ((Get-Item $tarball).Length / 1KB))

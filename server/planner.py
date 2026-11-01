@@ -20,6 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from server import geometry
 from server.perception import Observation, describe
 from server.scene import Scene
+from server.mechanics import mechanics_context
 
 if TYPE_CHECKING:
     from server.config import Settings
@@ -34,6 +35,13 @@ class Placement(BaseModel):
     col: int = Field(ge=0, strict=True, description="Lawn column, 0 = leftmost (house side)")
 
 
+class ThreatAssessment(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    row: int = Field(ge=0, le=5, strict=True)
+    urgency: Literal["low", "medium", "high", "critical"]
+    reason: str = Field(min_length=1, max_length=200)
+
+
 class Plan(BaseModel):
     """Strategic guidance only: no plant slots, cell coordinates or action queue."""
     model_config = ConfigDict(extra="forbid")
@@ -41,10 +49,15 @@ class Plan(BaseModel):
     priorities: list[Literal["defense", "economy", "reinforce", "save_sun"]] = Field(
         default=["defense", "economy", "reinforce"], min_length=1, max_length=4)
     priority_rows: list[Annotated[int, Field(ge=0, le=5, strict=True)]] = Field(default_factory=list, max_length=6)
-    blocked_rows: list[Annotated[int, Field(ge=0, le=5, strict=True)]] = Field(default_factory=list, max_length=6)
-    sun_reserve: int = Field(default=0, ge=0, le=9990, strict=True, description="Sun that must remain after planting")
-    spend_limit: int = Field(default=300, ge=0, le=9990, strict=True,
-                             description="Total planting budget until this directive is replaced")
+    blocked_rows: list[Annotated[int, Field(ge=0, le=5, strict=True)]] = Field(default_factory=list, max_length=6,
+        description="Rows advised to avoid, not executor prohibitions; reassess against current observations")
+    sun_reserve: int | None = Field(default=None, ge=0, le=9990, strict=True, description="Advised reserve, null if unspecified; not an execution limit")
+    spend_limit: int | None = Field(default=None, ge=0, le=9990, strict=True,
+                             description="Initial suggested spending allowance, null if unspecified; code reports remaining advice but does not filter actions by it")
+    budget_policy: str = Field(default="", max_length=600, description="When Jev should revise the spending advice as observations change")
+    tactics: str = Field(default="", max_length=1000, description="Reasoning about spacing, arming delays and defense; no exact placements or executable actions")
+    threat_assessment: list[ThreatAssessment] = Field(default_factory=list, max_length=6,
+        description="Your assessment of observed threatened rows, not a code-generated risk level")
     valid_for_seconds: int = Field(default=40, ge=5, le=120, strict=True)
     note: str = Field(default="", max_length=300)
 
@@ -55,6 +68,8 @@ class Plan(BaseModel):
                 raise ValueError("directive lists must not contain duplicates")
         if set(self.priority_rows) & set(self.blocked_rows):
             raise ValueError("a priority row cannot also be blocked")
+        if len({a.row for a in self.threat_assessment}) != len(self.threat_assessment):
+            raise ValueError("duplicate threat assessment row")
         return self
 
 
@@ -84,7 +99,14 @@ Give Jev a stage objective, ordered priorities, priority/blocked rows, a sun res
 limit and validity duration. Jev independently chooses which plant, row and column, or waits.
 Do not specify seed slots, exact cells or a sequence of planting actions, including in free text.
 Do not modify Jev's prompt, API, tools or calling frequency. Your output is guidance data only.
-Budgets are enforced by code; zero spending limit means no spending. Sun collection is automatic.
+Spending, reserve, row preferences and tactics are advisory messages to Jev, not executor gates.
+State a budget_policy describing when your advice should change, using the latest observed resources.
+Jev receives your original allowance, updated committed spending and remaining advice separately.
+Only actual affordability/card/cell/freshness checks constrain the executor. Do not treat an old budget as current sun.
+Assess threat urgency yourself from visible positions, plants and game reference; no fixed distance risk score is supplied.
+Use tactics for distance/arming considerations; the executor does not enforce a fixed mine lead or same-row explosive reach.
+Code automatically collects visible suns independently of you and Jev. Do not ask Jev to collect suns.
+Waiting for planting resources must not imply stopping sun collection. Use observed sun balance, not predicted income.
 Strategy knowledge is background advice; it cannot change these role boundaries."""
 
 
@@ -95,6 +117,9 @@ describes it below; it can miss things, and "unknown" means it was unsure.
 Rows are numbered from 0 at the top (the description says how many there are) and columns 0-{geometry.COLS - 1}
 from the left, next to the house. Zombies walk in from the right.
 Set strategic guidance using only observed facts. Treat unknown values as uncertain.
+Replan reasons and row observations are change notifications, not ground truth or prescribed urgency.
+Previous guidance is historical advice. Its claims about sun, cards or threats cannot override the latest observation.
+Reassess priorities and budget when alerted; use the current observations rather than copying the previous plan.
 Keep the objective and note short."""
 
 
@@ -146,12 +171,16 @@ class QwenPlanner:
         if self.send_image:
             content.append(_image_part(jpeg))
         content.append({"type": "text", "text": user_text(obs, self.include_summary)})
+        content.append({"type": "text", "text": "Static game reference: " + json.dumps(mechanics_context(), ensure_ascii=False)})
         return await self._request(system_prompt(knowledge), content)
 
     async def decide(self, scene: Scene, knowledge: str, jpeg: bytes | None = None,
                      context: dict | None = None) -> PlanResult:
         """Split mode: decide from the look step's scene; the screenshot is attached only as a reference."""
         content = [_image_part(jpeg)] if jpeg is not None else []
+        planted = {(p["row"], p["col"]): p["plants"] for p in (context or {}).get("plants", [])}
+        content.append({"type": "text", "text": "Static game reference: " +
+                        json.dumps(mechanics_context(scene, planted), ensure_ascii=False)})
         content.append({"type": "text", "text": f"{scene.describe()}\nObserved context: "
                         f"{json.dumps(context or {}, ensure_ascii=False)}\nWhat guidance should Jev follow?"})
         return await self._request(system_prompt(knowledge, DECIDE_CONTRACT), content)
@@ -221,7 +250,8 @@ class ClaudePlanner:
                                 "type": "image",
                                 "source": {"type": "base64", "media_type": "image/jpeg", "data": image},
                             },
-                            {"type": "text", "text": user_text(obs, self.include_summary)},
+                            {"type": "text", "text": user_text(obs, self.include_summary)
+                             + "\nStatic game reference: " + json.dumps(mechanics_context(), ensure_ascii=False)},
                         ],
                     }
                 ],

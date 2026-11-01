@@ -54,3 +54,15 @@ class FastPolicy:
             clicks.append(Click(sx, sy, f"select slot {p.slot}"))
             clicks.append(Click(cx, cy, f"plant at row {p.row} col {p.col}"))
         return clicks
+
+    def sun_candidates(self, obs: Observation, now: float | None = None) -> list[Click]:
+        """Enumerating options does not consume cooldown or authorize a click."""
+        now = time.monotonic() if now is None else now
+        return [Click(s.x, s.y, "collect sun", {"area": s.area, "hue": s.hue}) for s in obs.suns
+                if not any(now - t < self.cooldown and abs(s.x - x) + abs(s.y - y) < self.same_spot_px
+                           for t, x, y in self._recent_sun_clicks)][:10]
+
+    def mark_sun_clicked(self, click: Click):
+        now = time.monotonic()
+        self._recent_sun_clicks = [c for c in self._recent_sun_clicks if now - c[0] < self.cooldown]
+        self._recent_sun_clicks.append((now, click.x, click.y))

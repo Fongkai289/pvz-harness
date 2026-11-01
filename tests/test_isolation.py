@@ -4,14 +4,14 @@ import ast
 from pathlib import Path
 
 PLAYER_MODULES = ["server/perception.py", "server/policy.py", "server/planner.py", "server/decider.py",
-                  "server/scene.py", "server/action_selector.py"]
-FORBIDDEN = {"server.judge", "StateMsg"}
+                  "server/scene.py", "server/action_selector.py", "server/mechanics.py", "server/sun_collector.py"]
+FORBIDDEN = {"server.judge", "StateMsg", "client.mower_state"}
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def imported_names(path: Path) -> set[str]:
     names: set[str] = set()
-    for node in ast.walk(ast.parse(path.read_text())):
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
         if isinstance(node, ast.Import):
             names.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):

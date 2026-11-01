@@ -46,17 +46,18 @@ def test_candidates_include_all_available_columns_and_plant_types():
     assert all(ctx.reject(p) is None for p in offered)
 
 
-def test_constraints_are_enforced_before_model_call():
+def test_only_execution_constraints_filter_candidates():
     ctx = context(blocked_rows=[3], sun_reserve=100, spend_limit=100)
-    ctx.sun_spent = 150  # 150 available; leave 100, so only <=50-sun cards
+    ctx.sun_spent = 150  # 150 actually available; reserve/budget/row advice must not filter
     ctx.directive_spent = 50
     ctx.used_slots = {3}
     ctx.planted = {(1, 0): ["sunflower"]}
     offered = candidates(ctx)
     assert offered
-    assert all(p.slot in (1, 4) and p.row != 3 and (p.row, p.col) != (1, 0) for p in offered)
+    assert all(p.slot in (0, 1, 2, 4) and (p.row, p.col) != (1, 0) for p in offered)
+    assert any(p.slot == 0 and p.row == 3 for p in offered)
     ctx.directive_spent = 100
-    assert candidates(ctx) == []
+    assert candidates(ctx) == offered
 
 
 def test_unknown_or_inconsistent_observations_do_not_create_candidates():
@@ -100,6 +101,40 @@ def test_jev_selects_plant_row_and_column_not_a_rule_chosen_location():
     assert set(result.scores) == {"plant_row", "column"}
 
 
+@pytest.mark.parametrize("bad", [None, "model", "options", "index", "bool_index", "label", "scores", "nan", "bool_score", "body"])
+def test_bare_27b_choice_contract(bad):
+    seen = []
+    def handler(request):
+        body = json.loads(request.content)
+        seen.append(body)
+        offered = body["options"]
+        winner = "col7" if any(x.startswith("col") for x in offered) else "slot1_row3"
+        index = next(i for i, x in enumerate(offered) if x.startswith(winner + ":"))
+        data = {"protocol": "jev27-bare-v1", "model": "autotrust/JEV-27B-VL", "kind": "choice",
+                "options": offered, "choice_index": index, "choice": offered[index],
+                "probabilities": [1.0 if i == index else 0.0 for i in range(len(offered))]}
+        if bad == "model": data["model"] = "wrong-model"
+        elif bad == "options": data["options"] = list(reversed(offered))
+        elif bad == "index": data["choice_index"] = len(offered)
+        elif bad == "bool_index": data["choice_index"] = True
+        elif bad == "label": data["choice"] = "unknown action"
+        elif bad == "scores": data["probabilities"] = [1.0]
+        elif bad == "nan": data["probabilities"][0] = "NaN"
+        elif bad == "bool_score": data["probabilities"][0] = True
+        elif bad == "body": data = []
+        return httpx.Response(200, json=data)
+    model = OneJevSelector("http://jev.invalid/v1/decide", "autotrust/JEV-27B-VL", 1,
+                           httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    result = asyncio.run(model.select(context(), JevPolicy()))
+    assert all(set(body) == {"kind", "state", "options", "question", "strategy", "thinking"} for body in seen)
+    assert all(body["thinking"] == "off" and body["strategy"] == "auto" for body in seen)
+    if bad:
+        assert result.source == "failed" and result.placement is None
+    else:
+        assert result.error is None and result.placement == Placement(slot=1, row=3, col=7)
+        assert len(seen) == 2 and len(seen[0]["options"]) > 16
+
+
 @pytest.mark.parametrize("stage", ["group", "column"])
 def test_jev_can_choose_wait_at_either_stage(stage):
     seen = []
@@ -141,8 +176,17 @@ def test_deadline_covers_both_jev_calls():
 
 def test_no_legal_actions_does_not_call_shared_model():
     ctx = context(spend_limit=0)
+    ctx.scene.sun = 0
     result = asyncio.run(selector(lambda _: pytest.fail("no model call expected")).select(ctx, JevPolicy()))
     assert result.placement is None
+
+
+def test_zero_advised_budget_does_not_remove_legal_actions():
+    ctx = context(spend_limit=0)
+    seen = []
+    result = asyncio.run(selector(scorer(seen=seen)).select(ctx, JevPolicy()))
+    assert result.placement == Placement(slot=1, row=3, col=7)
+    assert seen and '"mode": "advisory"' in seen[0]["state"]
 
 
 @pytest.fixture
@@ -189,7 +233,7 @@ def test_inflight_decision_is_rechecked_before_clicking(session, change):
             if change == "new_scene": session.latest_scene = session.latest_scene.model_copy()
             if change == "used_card": session.used_slots.add(1)
             if change == "occupied": session.seen_plants[(3, 7)] = ["peashooter"]
-            if change == "spent": session.directive_spent = 50
+            if change == "spent": session.sun_spent = 300
             return Selection(placement=Placement(slot=1, row=3, col=7))
     session.selector = DelayedSelector()
     assert asyncio.run(session._jev_step(session.latest_obs)) is None
@@ -235,6 +279,81 @@ def test_no_guidance_or_scene_never_uses_planner_as_action_queue(session):
     session.latest_scene = None
     assert asyncio.run(session._jev_step(session.latest_obs)) is None
     assert not hasattr(session.policy, "set_plan")
+
+
+def test_planner_refresh_leads_expiry_and_does_not_extend_budget(session):
+    session.settings = replace(session.settings, plan_interval=20)
+    session.directive = Plan(objective="test", valid_for_seconds=15, spend_limit=0)
+    session._planner_latency = 3
+    delay = session._plan_delay()
+    assert 10 <= delay <= 10.5
+    assert session.directive.spend_limit == 0
+    session.directive_received -= 16
+    assert session._decision_context() is None
+    assert "过期" in session._decision_block_reason()
+
+
+def test_jev_is_called_even_when_advised_budget_is_zero(session, monkeypatch):
+    events = []
+    monkeypatch.setattr(session.runlog, "event", lambda kind, **data: events.append((kind, data)))
+    session.settings = replace(session.settings, decider="onejev")
+    session.telemetry_enabled = True
+    session.directive = Plan(objective="save", spend_limit=0)
+    asyncio.run(session._jev_step(session.latest_obs))
+    assert session._model_calls["jev"] == 1
+    decision = next(data for kind, data in events if kind == "jev")
+    assert decision["decision_id"] == 1 and not decision["rejected"]
+    assert decision["decision_context"]["budget_advice"]["remaining_advice"] == 0
+
+
+@pytest.mark.parametrize("choice", ["wait", "failed"])
+def test_jev_step_does_not_issue_sun_clicks(session, choice):
+    from server.perception import Blob
+    session.settings = replace(session.settings, decider="onejev")
+    session.latest_obs.suns = [Blob(300, 350, 1200, 25)]
+    class SunSelector:
+        async def select(self, ctx, policy):
+            assert not hasattr(ctx, "sun_targets")
+            return Selection(latency=.01, error="failed" if choice == "failed" else None)
+    session.selector = SunSelector()
+    asyncio.run(session._jev_step(session.latest_obs))
+    assert not session.ws.sent
+
+
+def test_live_send_rejects_unattributed_clicks_and_planner_commands(session):
+    session.settings = replace(session.settings, decider="onejev")
+    for action in ("click", "pause", "resume"):
+        with pytest.raises(PermissionError):
+            asyncio.run(session.send(action, session.latest_obs))
+
+
+def test_stale_plant_layout_blocks_planting(session):
+    from server.perception import Blob
+    session.looker = object()
+    session.latest_obs.suns = [Blob(300, 300, 1200, 25)]
+    ctx = session._decision_context()
+    assert not candidates(ctx)
+    assert ctx.reject(Placement(slot=1, row=1, col=1)) == "plant layout unavailable or stale"
+    session.seen_plants_frame = session.latest_obs.frame_id
+    session.plants_received = time.monotonic()
+    assert candidates(session._decision_context())
+    session.plants_received -= 100
+    assert not candidates(session._decision_context())
+
+
+def test_zombie_refresh_preserves_card_and_sun_ledger_and_has_own_expiry(session):
+    session.split_vision = True
+    session.sun_spent, session.directive_spent = 50, 50
+    session.used_slots = {1}
+    original_frame = session.latest_scene.frame_id
+    zombie_scene = session.latest_scene.model_copy(update={"frame_id": 200, "sun": None, "cards": []})
+    session._accept_zombies(zombie_scene, time.monotonic())
+    assert session.latest_scene.frame_id == original_frame
+    assert session.latest_scene.sun is not None and session.latest_scene.cards
+    assert session.sun_spent == 50 and session.used_slots == {1} and session.directive_spent == 50
+    assert not session._zombie_block_reason()
+    session.zombies_received -= 100
+    assert "过期" in session._zombie_block_reason() and session._decision_context() is None
 
 
 def test_old_placement_response_is_rejected_by_planner_transport():

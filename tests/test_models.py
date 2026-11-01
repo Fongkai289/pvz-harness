@@ -38,7 +38,9 @@ def test_qwen_text_only_sends_summary_and_parses_plan():
     system = seen["messages"][0]["content"]
     assert system.startswith("You are the strategic planner") and system.endswith("Buy Sunflowers first.")
     content = seen["messages"][1]["content"]
-    assert [part["type"] for part in content] == ["text"]
+    assert all(part["type"] == "text" for part in content)
+    assert "static_reference_not_live_state" in content[1]["text"]
+    assert "Code automatically collects visible suns" in system
     assert "1 sun visible" in content[0]["text"]
     assert seen["response_format"]["type"] == "json_schema"
     assert seen["chat_template_kwargs"] == {"enable_thinking": False}

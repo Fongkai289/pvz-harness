@@ -41,32 +41,6 @@ class FastParams(BaseModel):
     sun_same_spot_px: int = Field(ge=5, le=100, description="clicks closer than this count as the same spot")
 
 
-DECIDER_CHOICES = ("place", "wait")  # the code maps these keys to actions, so they are fixed
-
-
-class DeciderQuestion(BaseModel):
-    """Retired 2026-10-28 (replaced by JevPolicy); kept so playbook versions written before then still load."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    instructions: str = Field(
-        default="Should the next planned plant be placed right now?", min_length=10, max_length=400)
-    criteria: dict[str, str] = Field(
-        default={
-            "place": "place it now: the lawn needs it and nothing more urgent is happening",
-            "wait": "wait: placing it now would be wasted or something else must happen first",
-        },
-        description=f"exactly the keys {DECIDER_CHOICES}, each with a short description")
-
-    @model_validator(mode="after")
-    def _keys(self) -> DeciderQuestion:
-        if set(self.criteria) != set(DECIDER_CHOICES):
-            raise ValueError(f"criteria keys must be exactly {DECIDER_CHOICES}")
-        if any(not 5 <= len(v) <= 300 for v in self.criteria.values()):
-            raise ValueError("each option description must be 5-300 characters")
-        return self
-
-
 JEV_ACTIONS = ("emergency", "attack", "reinforce", "follow_plan", "economy", "wait")  # code executes these; fixed
 ATTACK_ROWS = ("threatened", "all")
 
@@ -157,9 +131,10 @@ class JevPolicy(BaseModel):
 
 
 class PlannerKnowledge(BaseModel):
-    """Read by the planner model (Qwen) as strategy knowledge, appended to its fixed task contract.
+    """Read by both Planner and Jev as editable strategy knowledge alongside their role contracts.
 
-    Write it for the planner: short, concrete rules it can act on from what it sees.
+    Describe budget adjustments, tactical spacing and threat reasoning from observed facts.
+    These are model advice, not code filters. Do not encode exact actions or hidden state.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -170,6 +145,23 @@ class PlannerKnowledge(BaseModel):
         max_length=8000)
 
 
+class TimingParams(BaseModel):
+    """Read by the session scheduler: target seconds between call starts, with no overlap.
+
+    Coach-editable between evaluated versions, not live model tool permissions.
+    Null inherits the server setting; explicit values override it for this version.
+    """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    resources_seconds: float | None = Field(default=None, ge=2, le=30, strict=True)
+    zombies_seconds: float | None = Field(default=None, ge=2, le=30, strict=True)
+    plants_seconds: float | None = Field(default=None, ge=2, le=30, strict=True)
+    planner_seconds: float | None = Field(default=None, ge=4, le=60, strict=True)
+    frame_log_seconds: float | None = Field(default=None, ge=1, le=60, strict=True)
+    danger_replan: bool = True
+    danger_min_seconds: float = Field(default=4, ge=2, le=12, strict=True)
+
+
 class Playbook(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -177,10 +169,23 @@ class Playbook(BaseModel):
     parent: str | None = None
     perception: PerceptionParams
     fast: FastParams
-    decider: DeciderQuestion = Field(default_factory=DeciderQuestion)  # retired, not read
     jev: JevPolicy = Field(default_factory=JevPolicy)
     planner: PlannerKnowledge = Field(default_factory=PlannerKnowledge)
+    timing: TimingParams = Field(default_factory=TimingParams)
     notes: str = Field(default="", max_length=2000)
+    player_code: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$",
+                                    description="Immutable evaluated System0 code; only Engineer's gated promotion can set it")
+
+    @model_validator(mode="before")
+    @classmethod
+    def discard_retired_decider(cls, data):
+        # Immutable historical versions remain readable; never serialize this dead section again.
+        if isinstance(data, dict) and "decider" in data:
+            data = {k: v for k, v in data.items() if k != "decider"}
+        return data
+
+    def active_dump(self, selector: str) -> dict:
+        return self.model_dump(exclude={"jev"} if selector == "onejev" else set())
 
 
-EDITABLE_SECTIONS = ("perception", "fast", "jev", "planner")  # what the coach may propose changes to
+EDITABLE_SECTIONS = ("perception", "fast", "jev", "planner", "timing")

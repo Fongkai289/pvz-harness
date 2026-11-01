@@ -97,6 +97,37 @@ def test_classify_lawn_from_colour():
     assert [classify_lawn(i) for i in (day, night, pool)] == ["day", "night", "pool"]
 
 
+def test_resource_and_zombie_models_have_separate_requests_and_fields():
+    from server.scene import QwenLooker
+    seen = []
+    def handler(request):
+        body = json.loads(request.content)
+        name = body["response_format"]["json_schema"]["name"]
+        seen.append(name)
+        content = ({"sun": 75} if name == "resource_report" else
+                   {"rows": [{"zombies": ["normal"] if i == 2 else [], "nearest_col": 4 if i == 2 else None}
+                             for i in range(5)]})
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(content)}}]})
+    image = np.zeros((600, 800, 3), np.uint8)
+    image[:] = (60, 40, 30)  # night: use model zombie positions, without day-only code matching
+    looker = QwenLooker("http://qwen", "test", 2, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    resource = asyncio.run(looker.look_resources(image, 1, ["sunflower"]))
+    zombies = asyncio.run(looker.look_zombies(image, 2, ["sunflower"]))
+    assert seen == ["resource_report", "zombie_report"]
+    assert resource.scene.sun == 75 and resource.scene.zombies == []
+    assert zombies.scene.sun is None and zombies.scene.cards == []
+    assert zombies.scene.nearest_col == {2: 4}
+
+
+def test_zombie_reader_rejects_missing_rows():
+    from server.scene import QwenLooker
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"rows": []}'}}]})
+    looker = QwenLooker("http://qwen", "test", 2, httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    result = asyncio.run(looker.look_zombies(np.zeros((600, 800, 3), np.uint8), 1, []))
+    assert result.error and result.scene is None
+
+
 def test_scene_describe_is_compact_and_complete():
     text = SCENE.describe()
     assert "pool (6 rows)" in text and "Sun: 75" in text
@@ -135,4 +166,6 @@ def test_decide_reads_the_scene_not_the_picture():
     assert result.plan.priority_rows == [1]
     assert seen["messages"][0]["content"].startswith(DECIDE_CONTRACT)
     content = seen["messages"][1]["content"]
-    assert [p["type"] for p in content] == ["text"] and "row 1: conehead@col8" in content[0]["text"]
+    assert content and all(p['type']=='text' for p in content)
+    assert any('row 1: conehead@col8' in p['text'] for p in content)
+    assert any('Static game reference:' in p['text'] for p in content)

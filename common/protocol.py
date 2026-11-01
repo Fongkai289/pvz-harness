@@ -47,6 +47,7 @@ class Hello(BaseModel):
     client_id: str
     game_version: str | None = None
     playbook: str | None = None  # evaluation runs pin a version; None = the promoted one
+    telemetry: bool = False  # opt-in: old clients only understand Command messages
 
 
 class StateMsg(BaseModel):
@@ -107,6 +108,18 @@ class Welcome(BaseModel):
     protocol: int = PROTOCOL_VERSION
     session_id: str
     playbook: str
+    telemetry: bool = False
+
+
+class ModelTiming(BaseModel):
+    type: Literal["model_timing"] = "model_timing"
+    stage: Literal["scene", "zombies", "plants", "plan", "jev"]
+    latency_ms: float = Field(default=0, ge=0, allow_inf_nan=False)
+    error: bool = False
+    status: Literal["idle", "running", "completed", "failed"] = "completed"
+    call_id: int = Field(default=0, ge=0)
+    interval_s: float | None = Field(default=None, ge=0, allow_inf_nan=False)
+    reason: str = Field(default="", max_length=160)
 
 
 def dumps(msg: BaseModel) -> str:

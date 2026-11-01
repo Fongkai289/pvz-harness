@@ -4,19 +4,13 @@
     ssh -N -L 8765:127.0.0.1:8765 -p 22 -i <key> root@<server>    # tunnel, keep open
     python -m client.windows_client                   # token: --token or $env:PVZ_TOKEN
 
-Captures the game window's client area, streams it, and executes clicks relative
-to that area. Pause/resume commands suspend and resume the game process
-(popcapgame1.exe, the child of the Steam launcher).
-
-A small control window next to the game lets the operator pause, resume, restart
-the level (a new server session per attempt) and stop; without --seconds the
-client runs until Stop.
-
-The game must run windowed (full screen minimizes itself on focus loss), stay
-uncovered (mss copies screen pixels, so anything on top lands in the frame and
-takes the clicks), and keep focus (it opens its own pause menu when it loses focus;
-unless the operator paused, the client closes that menu again). The window is made
-topmost for the run; clicks on a point the game does not own are refused.
+Captures the game client area and executes Jev-authorized gameplay clicks only.
+Start / Pause / Resume / Stop control this client, never the game menus or process.
+The client starts disabled. Once enabled, it waits for the operator to bring the game
+to the foreground and manually enter/resume play. Menu/focus holds clear automatically
+when a stable playable screen returns; an explicit client pause never clears itself.
+Game win/loss still closes the session and requests coach review. The operator alone
+handles rewards, seed selection and retries. No game UI click or focus stealing is used.
 """
 
 from __future__ import annotations
@@ -26,7 +20,6 @@ import asyncio
 import ctypes
 import logging
 import os
-import statistics
 import threading
 import time
 
@@ -37,10 +30,15 @@ import psutil
 import pydirectinput
 import win32api
 import win32con
+import win32event
 import win32gui
 import win32process
 
 from client.link import ServerLink
+from client.model_activity import ModelActivity, activity_lines
+from client.mower_state import MowerMonitor
+from client.operator_view import OperatorView
+from client.menu import is_playing, is_blocking_menu
 from common.protocol import Command
 
 WINDOW_TITLE = "Plants vs. Zombies"
@@ -48,18 +46,13 @@ WINDOW_TITLE = "Plants vs. Zombies"
 WINDOW_CLASS = "MainWindow"
 JPEG_QUALITY = 80
 CLICK_SETTLE_S = 0.03  # enough for cards and the lawn
-BUTTON_HOVER_S = 0.3  # menu buttons only react after the pointer has hovered over them
-AUTO_RESUME_GAP_S = 1.5
 
-# Game screens, 800x600 client coordinates (docs/env.md).
-RESUME_BUTTON = (390, 448)  # "Resume Game" on the pause menu
-RESTART_CLICKS = [  # (x, y, wait after): Menu -> Restart Level -> confirm Restart
-    (738, 14, 1.0),
-    (398, 355, 1.0),
-    (303, 393, 1.0),
-]
 
 log = logging.getLogger("pvz.windows")
+
+
+class GamePaused(RuntimeError):
+    """Gameplay unavailable; observe and wait without changing the game."""
 
 
 def make_dpi_aware() -> None:
@@ -76,13 +69,6 @@ def click_screen(x: int, y: int, hover: float = CLICK_SETTLE_S) -> None:
     pydirectinput.mouseUp()
 
 
-def is_pause_panel(frame: np.ndarray) -> bool:
-    """The game's dark slate pause menu. Its in-game Menu dialog looks the same, so this is
-    only consulted while that dialog cannot be open (not during a restart)."""
-    b, g, r = frame[200:380, 260:540].reshape(-1, 3).mean(0)
-    return g < 90 and b > g and (b + g + r) / 3 < 70
-
-
 class GameWindow:
     def __init__(self, title: str = WINDOW_TITLE) -> None:
         self.hwnd = win32gui.FindWindow(WINDOW_CLASS, title)
@@ -94,9 +80,6 @@ class GameWindow:
         self.process = psutil.Process(pid)
         self._local = threading.local()  # mss handles are per thread
         pydirectinput.PAUSE = 0  # no built-in delay between input events
-        self.auto_resume = True
-        self.auto_resumes = 0
-        self._last_auto_resume = 0.0
         _, _, w, h = self.client_rect()
         if (w, h) != (800, 600):
             log.warning("client area is %dx%d, not 800x600: check the game's high-DPI override", w, h)
@@ -121,52 +104,40 @@ class GameWindow:
         """True if the screen point (x, y) shows the game, not a window on top of it."""
         return win32gui.GetAncestor(win32gui.WindowFromPoint((x, y)), win32con.GA_ROOT) == self.hwnd
 
+    def operator_has_focus(self) -> bool:
+        foreground = win32gui.GetForegroundWindow()
+        if not foreground:
+            return False
+        _, pid = win32process.GetWindowThreadProcessId(foreground)
+        return pid == os.getpid()
+
+    def has_focus(self) -> bool:
+        return win32gui.GetForegroundWindow() == self.hwnd
+
     def capture(self) -> np.ndarray:
         x0, y0, w, h = self.client_rect()
         return np.asarray(self.sct.grab({"left": x0, "top": y0, "width": w, "height": h}))[:, :, :3]
 
-    def press_button(self, x: int, y: int) -> None:
-        """Click a game UI button (client coordinates), hovering first so the button arms."""
-        x0, y0, _, _ = self.client_rect()
-        if not self.owns(x0 + x, y0 + y):
-            raise RuntimeError(f"button ({x},{y}) refused: another window covers the game there")
-        click_screen(x0 + x, y0 + y, hover=BUTTON_HOVER_S)
-
-    def take_focus(self) -> None:
-        """Bring the game forward and close its own pause menu (it opens one on every focus loss)."""
-        try:
-            win32gui.SetForegroundWindow(self.hwnd)
-        except Exception as e:  # Windows may refuse; the first click still focuses the game
-            log.warning("could not focus the game: %s", e)
-        time.sleep(0.3)
-        if is_pause_panel(self.capture()):
-            log.info("game is on its pause menu; resuming")
-            self.press_button(*RESUME_BUTTON)
-            time.sleep(0.5)
-
-    def restart_level(self) -> None:
-        self.take_focus()
-        for x, y, wait in RESTART_CLICKS:
-            self.press_button(x, y)
-            time.sleep(wait)
+    def ready(self) -> bool:
+        """Positive gameplay check used only while waiting; never takes focus or clicks."""
+        return self.has_focus() and is_playing(self.capture())
 
     def grab(self) -> tuple[bytes, int, int]:
+        if not self.has_focus():
+            raise GamePaused("等待你将游戏置于前台并手动恢复对局")
         shot = self.capture()
-        if self.auto_resume and is_pause_panel(shot) and time.monotonic() - self._last_auto_resume > AUTO_RESUME_GAP_S:
-            # Focus went elsewhere and the game paused itself; the operator did not ask for it.
-            self._last_auto_resume = time.monotonic()
-            self.auto_resumes += 1
-            log.info("game paused itself (focus lost); resuming")
-            try:
-                self.press_button(*RESUME_BUTTON)
-            except RuntimeError as e:
-                log.warning("auto-resume failed: %s", e)
+        if is_blocking_menu(shot):
+            raise GamePaused("等待你手动进入或恢复游戏")
         ok, buf = cv2.imencode(".jpg", shot, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if not ok:
             raise RuntimeError("jpeg encode failed")
         return buf.tobytes(), shot.shape[1], shot.shape[0]
 
     async def execute(self, cmd: Command) -> dict | None:  # outcome unknown on the real game: None
+        if cmd.action != "click":
+            raise ValueError("real client accepts gameplay clicks only; game controls are manual")
+        if not self.has_focus() or is_blocking_menu(self.capture()):
+            raise GamePaused("游戏尚未就绪；已拦截输入，等待你手动恢复游戏")
         if cmd.action == "click":
             x0, y0, w, h = self.client_rect()
             if not (0 <= cmd.x < w and 0 <= cmd.y < h):
@@ -174,28 +145,38 @@ class GameWindow:
             if not self.owns(x0 + cmd.x, y0 + cmd.y):
                 raise RuntimeError(f"click ({cmd.x},{cmd.y}) refused: another window covers the game there")
             click_screen(x0 + cmd.x, y0 + cmd.y)
-        elif cmd.action == "pause":
-            self.process.suspend()
-        elif cmd.action == "resume":
-            self.process.resume()
-        elif cmd.action == "set_speed":
-            raise NotImplementedError("speed control is decided in environment verification step 6")
 
 
 class ControlPanel:
-    """Operator window next to the game: pause / resume / restart level / stop.
-
-    Tk runs in its own thread; the asyncio side only reads the events below. While held
-    (paused or restarting) no frames go up and server commands are refused."""
+    """Client lifecycle controls, independent of manual game controls."""
 
     def __init__(self, game: GameWindow) -> None:
         self.game = game
         self.paused = threading.Event()
-        self.restart = threading.Event()  # asks the main loop to end the session and restart
-        self.restarting = threading.Event()
-        self.stop = threading.Event()
+        self.started = threading.Event()
+        self.waiting = threading.Event()
+        self.waiting.set()
+        self.paused.set()
+        self._ready_samples = 0
+        self.stop = threading.Event()  # window/application shutdown only
+        self.ended = False
+        self.generation = 0
+        self.run_id = 0
+        self.link_active = threading.Event()
+        self.message = "点开始启用客户端；游戏开始、暂停、重打由你手动操作"
+        self._stats_process = psutil.Process(os.getpid())
+        self._stats_time = time.monotonic()
+        self._stats_link = None
+        self._stats_bytes = (0, 0)
+        self._upload = self._download = 0.0
+        self._memory_mb = 0.0
+        self._idle_activity = ModelActivity()
+        self._input_lock = threading.RLock()
         self.link: ServerLink | None = None
         self.sessions: list[str] = []
+        self.operator_view = None
+        self.judge_state = None  # operator display + terminal guard only; never sent to player models
+        self.awaiting_new_round = False
         self._thread = threading.Thread(target=self._run, name="control-panel", daemon=True)
 
     def start(self) -> None:
@@ -204,104 +185,223 @@ class ControlPanel:
     # ---- asyncio side ----
 
     def held(self) -> bool:
-        return self.paused.is_set() or self.restarting.is_set()
+        return (not self.started.is_set() or self.paused.is_set()
+                or self.waiting.is_set() or self.stop.is_set())
 
-    def grab(self) -> tuple[bytes, int, int]:
-        while self.held() and not (self.stop.is_set() or self.restart.is_set()):
-            time.sleep(0.05)
-        return self.game.grab()
+    def wait_for_game(self, reason="等待你手动进入或恢复游戏") -> None:
+        self.waiting.set()
+        self._ready_samples = 0
+        if self.link:
+            self.link.model_activity.freeze()
+        self.message = reason
 
-    async def execute(self, cmd: Command) -> dict | None:
-        if self.held():
-            raise RuntimeError("held by the operator (paused or restarting)")
-        return await self.game.execute(cmd)
+    def check_ready(self) -> bool:
+        with self._input_lock:
+            if not self.started.is_set() or self.paused.is_set() or self.stop.is_set():
+                return False
+            # The same confirmed outcome already stops ServerLink; never reconnect to an award lawn.
+            if ((self.judge_state or {}).get("outcome") or
+                    (self.awaiting_new_round and self.judge_state is None)):
+                self._ready_samples = 0
+                return False
+            if self.game.ready():
+                self._ready_samples += 1
+            else:
+                self._ready_samples = 0
+            if self._ready_samples < 2:
+                return False
+            self.waiting.clear()
+            self.awaiting_new_round = False
+            self.message = "游戏画面已就绪；正在连接客户端"
+            return True
 
-    def do_restart(self) -> None:
-        self.restarting.set()
-        self.game.auto_resume = False  # the Menu dialog would look like the pause menu
-        try:
-            self.game.restart_level()
-        finally:
-            self.game.auto_resume = True
-            self.restart.clear()
-            self.paused.clear()
-            self.restarting.clear()
+    def grab(self, generation=None) -> tuple[bytes, int, int]:
+        with self._input_lock:
+            if self.held() or (generation is not None and generation != self.generation):
+                raise GamePaused("capture held by operator")
+            try:
+                return self.game.grab()
+            except GamePaused as e:
+                log.info("capture hold reason: %s", e)
+                self.wait_for_game(str(e))
+                raise
+
+    async def execute(self, cmd: Command, generation=None) -> dict | None:
+        with self._input_lock:
+            if self.held() or (generation is not None and generation != self.generation):
+                raise RuntimeError("client held (not started, paused, or waiting for game)")
+            try:
+                return await self.game.execute(cmd)
+            except GamePaused as e:
+                log.info("input hold reason: %s", e)
+                self.wait_for_game(str(e))
+                raise
 
     # ---- Tk side ----
 
     def _run(self) -> None:
         import tkinter as tk
+        from client.control_view import ControlView
 
         root = tk.Tk()
         root.title("PvZ 控制")
         root.attributes("-topmost", True)
-        root.resizable(False, False)
-        root.protocol("WM_DELETE_WINDOW", self._on_stop)
-        font = ("Microsoft YaHei UI", 10)
-        self._status = tk.StringVar(value="连接中…")
-        tk.Label(root, textvariable=self._status, font=font, justify="left", anchor="w", width=30).pack(
-            padx=8, pady=(8, 4), fill="x")
-        row = tk.Frame(root)
-        row.pack(padx=8, pady=(0, 8))
-        for text, cmd in (("暂停", self._on_pause), ("继续", self._on_resume),
-                          ("重玩本关", self._on_restart), ("结束", self._on_stop)):
-            tk.Button(row, text=text, font=font, width=7, command=cmd).pack(side="left", padx=2)
+        root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._view = ControlView(root, {"开始": self._on_start, "暂停": self._on_pause,
+                                        "继续": self._on_resume, "结束": self._on_stop})
+        self._buttons = self._view.buttons
         root.update_idletasks()
-        # Beside the game, never over it: a covered game point refuses clicks.
         x0, y0, w, _ = self.game.client_rect()
-        mon = win32api.GetMonitorInfo(win32api.MonitorFromWindow(self.game.hwnd))["Monitor"]
+        mon = win32api.GetMonitorInfo(win32api.MonitorFromWindow(self.game.hwnd))["Work"]
         x = x0 + w + 16 if x0 + w + 16 + root.winfo_width() <= mon[2] else max(mon[0], x0 - root.winfo_width() - 16)
-        root.geometry(f"+{x}+{y0}")
+        y = max(mon[1], min(y0, mon[3] - root.winfo_height()))
+        root.geometry(f"+{x}+{y}")
         self._root = root
         self._tick()
         root.mainloop()
-        # Tk objects must die in the thread that made them, not at interpreter exit.
-        self._status = self._root = None
+        self._root = self._view = self._buttons = None
         del root
         import gc
         gc.collect()
 
     def close(self) -> None:
-        self.stop.set()
+        self._on_close()
         self._thread.join(timeout=3)
+
+    def client_state(self) -> str:
+        return ("已结束" if self.ended else "未开始" if not self.started.is_set()
+                else "已暂停" if self.paused.is_set()
+                else "等待游戏就绪" if self.waiting.is_set() else "运行中")
+
+    def button_states(self) -> dict[str, bool]:
+        active, paused = self.started.is_set(), self.paused.is_set()
+        available = not self.stop.is_set()
+        settled = not self.link_active.is_set()
+        return {"开始": available and not active and settled,
+                "暂停": available and active and not paused,
+                "继续": available and active and paused and settled,
+                "结束": available and active}
 
     def _tick(self) -> None:
         if self.stop.is_set():
             self._root.destroy()
             return
-        state = ("重玩中…" if self.restarting.is_set() or self.restart.is_set()
-                 else "已暂停" if self.paused.is_set() else "运行中")
-        lines = [f"状态：{state}"]
-        if self.link and self.link.session_id:
-            lines.append(f"会话：{self.link.session_id}")
-            lat = self.link.latencies
-            lines.append(f"命令：{len(lat)}" + (f"  延迟中位数 {statistics.median(lat) * 1000:.0f} ms" if lat else ""))
-        lines.append(f"自动解除暂停：{self.game.auto_resumes} 次")
-        self._status.set("\n".join(lines))
+        now = time.monotonic()
+        if self.link is not self._stats_link:
+            self._stats_link = self.link
+            self._stats_bytes = (0, 0)
+            self._stats_time = now
+            self._upload = self._download = 0.0
+        if now - self._stats_time >= 1:
+            counts = (self.link.bytes_sent, self.link.bytes_received) if self.link else (0, 0)
+            self._upload, self._download = [(b-a)/(now-self._stats_time)/1024 for a,b in zip(self._stats_bytes, counts)]
+            self._stats_bytes, self._stats_time = counts, now
+            self._memory_mb = self._stats_process.memory_info().rss / 1024**2
+        stats = self.link.latency_summary() if self.link else {"commands": 0}
+        rtt = self.link.rtt_ms if self.link else None
+        retained = bool(self.link and self.held())
+        metrics = {
+            "rtt": (f"{rtt:.0f} ms" if rtt is not None else "—", "上次网络往返" if retained else "网络往返延迟"),
+            "latency": (f"{stats['latency_median_ms']:.0f} ms" if stats['commands'] else "—",
+                        f"p95 {stats['latency_p95_ms']:.0f} ms · {stats['commands']}次点击" if stats['commands'] else "端到端 · 等待点击样本"),
+            "memory": (f"{self._memory_mb:.1f} MiB", "控制客户端 RSS"),
+            "traffic": (f"{self._upload:.1f} / {self._download:.1f}", "KiB/s · 对局应用数据"),
+        }
+        if self.link and self.link.session_id and self.link_active.is_set() and not self.held():
+            if self.message == "游戏画面已就绪；正在连接客户端":
+                self.message = "已连接；正在控制真实游戏"
+        message = self.message
+        if self.link and self.held() and self.link_active.is_set():
+            message += " · 正在清理旧连接，输入已停止"
+        elif self.link and not self.held():
+            message += f" · 截图上传目标 {self.link.fps:g} 帧/秒"
+        activity = self.link.model_activity if self.link else self._idle_activity
+        samples = {stage: activity.snapshot(stage) for stage in ("scene", "zombies", "plants", "plan", "jev")}
+        details = {}
+        coach = "Coach · 胜负后自动复盘"
+        if self.operator_view:
+            details = {"decisions": self.operator_view.decisions_text(), "review": self.operator_view.review_text(),
+                       "playbook": self.operator_view.playbook_text(), "mechanics": self.operator_view.mechanics_text()}
+            coach = {"queued": "Coach · 等待复盘", "reviewing": "Coach · 正在复盘",
+                     "completed": "Coach · 复盘已完成，可在赛后复盘页查看", "failed": "Coach · 复盘失败"}.get(self.round_review_status(), coach)
+            coach += "\n" + self.operator_view.collection_text()
+        self._view.update(self.client_state(), metrics, samples, message, coach, details,
+                          retained, (self.judge_state or {}).get("outcome"))
+        self._view.set_buttons(self.button_states())
         self._root.after(300, self._tick)
 
+    def round_review_status(self):
+        if not self.operator_view:
+            return "not_triggered"
+        review = self.operator_view.review
+        if (self.link and getattr(self.link, "game_outcome", None)
+                and review.get("session") != self.link.session_id):
+            return "queued"
+        return review.get("status", "not_triggered")
+
     def _on_pause(self) -> None:
-        # Clicking this window already took focus from the game, which pauses itself.
-        self.paused.set()
+        with self._input_lock:
+            if not self.button_states()["暂停"]:
+                return
+            self.generation += 1
+            self.paused.set()
+            self.wait_for_game("客户端已暂停；点继续恢复客户端，游戏由你手动控制")
+
+    def _on_start(self) -> None:
+        with self._input_lock:
+            if not self.button_states()["开始"]:
+                return
+            self.generation += 1
+            self.ended = False
+            self.run_id += 1
+            self.started.set()
+            self.wait_for_game()
+            self.paused.clear()
 
     def _on_resume(self) -> None:
-        def resume() -> None:
-            self.game.take_focus()  # allowed: this process owns the foreground right now
+        with self._input_lock:
+            if not self.button_states()["继续"]:
+                return
+            self.generation += 1
+            self.wait_for_game()
             self.paused.clear()
-        threading.Thread(target=resume, daemon=True).start()
-
-    def _on_restart(self) -> None:
-        self.paused.set()  # hold frames and commands until the restart is done
-        self.restart.set()
 
     def _on_stop(self) -> None:
-        self.stop.set()
+        with self._input_lock:
+            if not self.button_states()["结束"]:
+                return
+            self.generation += 1
+            self.started.clear()
+            self.paused.set()
+            self.ended = True
+            self.wait_for_game("客户端已结束；窗口和记录保留，点开始可重新运行")
+
+    def _on_close(self) -> None:
+        with self._input_lock:
+            self.generation += 1
+            self.stop.set()
+            self.started.clear()
+            self.paused.set()
+            self.wait_for_game("正在退出控制窗口")
 
 
-def read_state() -> dict | None:
-    # Read-only memory reads (pymem) go here once offsets for the installed game
-    # version are confirmed in environment verification step 4.
-    return None
+async def run_link_until_held(link, done) -> None:
+    """Also interrupt a connection/handshake that has not reached run's done loop."""
+    task = asyncio.create_task(link.run(done=done))
+    try:
+        while not task.done() and not done():
+            await asyncio.wait({task}, timeout=.05)
+        if task.done():
+            await task
+            return
+        # Give an established connection time to send its final episode report.
+        await asyncio.wait({task}, timeout=.5)
+        if task.done():
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 async def main() -> None:
@@ -309,45 +409,128 @@ async def main() -> None:
     parser.add_argument("--url", default="ws://127.0.0.1:8765/ws")
     parser.add_argument("--token", default=os.environ.get("PVZ_TOKEN"),
                         help="defaults to $env:PVZ_TOKEN, so it stays out of the command line")
-    parser.add_argument("--seconds", type=float, default=None, help="stop after this long; default: run until Stop")
-    parser.add_argument("--fps", type=float, default=20)
+    parser.add_argument("--seconds", type=float, default=None, help="exit after this long; default: keep panel open until closed")
+    parser.add_argument("--fps", type=float, default=5)
     parser.add_argument("--game-version", default="1.2.0.1096")
     parser.add_argument("--no-topmost", action="store_true", help="leave the window's z-order alone")
     args = parser.parse_args()
     if not args.token:
         parser.error("no token: pass --token or set $env:PVZ_TOKEN")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    instance = win32event.CreateMutex(None, False, "Local\\PvZHarnessWindowsClient")
+    if win32api.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        instance.Close()
+        log.warning("客户端已经运行，请切回已有的“PvZ 控制”窗口")
+        existing = win32gui.FindWindow(None, "PvZ 控制")
+        if existing:
+            try:
+                win32gui.SetForegroundWindow(existing)
+            except Exception:
+                pass
+        return
 
     make_dpi_aware()
     game = GameWindow()
+    mower_monitor = None
+    monitor_attempted = False
+    monitor_run = None
     if not args.no_topmost:
         game.set_topmost(True)
     panel = ControlPanel(game)
+    panel.operator_view = OperatorView(args.url, args.token)
+    operator_task = asyncio.create_task(panel.operator_view.run())
+    async def update_judge_display():
+        while True:
+            if mower_monitor:
+                panel.judge_state = mower_monitor.read_state()
+            await asyncio.sleep(.1)
+    judge_display_task = asyncio.create_task(update_judge_display())
+    # Never take over the mouse or resume the game merely because the client launched.
+    panel.paused.set()
     panel.start()
-    game.take_focus()
     deadline = time.monotonic() + args.seconds if args.seconds else None
 
-    def done() -> bool:
-        return panel.stop.is_set() or panel.restart.is_set() or (deadline is not None and time.monotonic() > deadline)
+    def expired() -> bool:
+        return deadline is not None and time.monotonic() > deadline
 
     try:
         while True:
-            link = ServerLink(args.url, args.token, "windows", panel.grab, panel.execute,
-                              read_state=read_state, fps=args.fps, game_version=args.game_version)
-            panel.link = link
-            await link.run(done=done)
-            panel.sessions.append(link.session_id or "?")
-            print(link.session_id, link.latency_summary(), flush=True)
-            if not panel.restart.is_set() or panel.stop.is_set():
+            if panel.stop.is_set() or expired():
                 break
-            log.info("restarting the level")
-            await asyncio.to_thread(panel.do_restart)
+            if not panel.started.is_set():
+                if mower_monitor:
+                    mower_monitor.close()
+                    mower_monitor = None
+                monitor_attempted = False
+                await asyncio.sleep(0.1)
+                continue
+            if monitor_run != panel.run_id:
+                if mower_monitor:
+                    mower_monitor.close()
+                    mower_monitor = None
+                monitor_attempted = False
+                monitor_run = panel.run_id
+            if not monitor_attempted:
+                monitor_attempted = True
+                try:
+                    mower_monitor = MowerMonitor(game.process.pid)
+                except (OSError, ValueError) as e:
+                    log.warning("小推车裁判采集不可用：%s", e)
+            if panel.paused.is_set():
+                await asyncio.sleep(0.1)
+                continue
+            if panel.waiting.is_set():
+                try:
+                    ready = await asyncio.to_thread(panel.check_ready)
+                except Exception as exc:
+                    panel.message = f"等待游戏画面：{type(exc).__name__}"
+                    ready = False
+                if not ready:
+                    await asyncio.sleep(0.2)
+                    continue
+            with panel._input_lock:
+                if panel.held():
+                    continue
+                generation = panel.generation
+                panel.link_active.set()
+            link = ServerLink(args.url, args.token, "windows",
+                              lambda g=generation: panel.grab(g),
+                              lambda cmd, g=generation: panel.execute(cmd, g),
+                              read_state=mower_monitor.read_state if mower_monitor else None,
+                              fps=args.fps, game_version=args.game_version)
+            panel.link = link
+            try:
+                await run_link_until_held(link, lambda: panel.held() or expired() or panel.generation != generation)
+            except GamePaused as e:
+                if panel.generation == generation:
+                    panel.wait_for_game(str(e))
+            except Exception as e:
+                if panel.generation == generation:
+                    panel._on_pause()
+                    panel.message = f"连接中断（{type(e).__name__}）；检查服务后点“继续”"
+                log.warning("session stopped: %s", e)
+            finally:
+                panel.link_active.clear()
+            panel.sessions.append(link.session_id or "?")
+            if getattr(link, "game_outcome", None):
+                panel.awaiting_new_round = True
+                if panel.generation == generation:
+                    panel.wait_for_game("本局结束；Coach自动复盘。请手动领奖或重打，客户端等待游戏就绪")
+            print(link.session_id, link.latency_summary(), flush=True)
+            if panel.stop.is_set() or expired():
+                break
     finally:
+        for task in (operator_task, judge_display_task):
+            task.cancel()
+        await asyncio.gather(operator_task, judge_display_task, return_exceptions=True)
+        if mower_monitor:
+            mower_monitor.close()
         panel.close()
-        if game.process.status() == psutil.STATUS_STOPPED:
-            game.process.resume()  # never leave the game suspended
         if not args.no_topmost:
             game.set_topmost(False)
+        instance.Close()
     print("sessions:", ", ".join(panel.sessions))
 
 

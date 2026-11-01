@@ -87,11 +87,12 @@ def test_armed_plants_go_ahead_of_the_zombie():
     assert act(checked(ctx(scene({2: 2}, ready=(4,)))))[2] is None  # no room left to arm in time
 
 
-def test_hard_rules_want_traps_well_ahead():
+def test_hard_rules_leave_trap_spacing_to_strategy():
     sc = scene({2: 5}, sun=500)
     assert hard_rules.check(Placement(slot=4, row=2, col=2), sc, {}, set()) is None
-    assert "3-6 columns to its right" in hard_rules.check(Placement(slot=4, row=2, col=5), sc, {}, set())
-    assert "3-6 columns to its right" in hard_rules.check(Placement(slot=4, row=2, col=6), sc, {}, set())
+    assert hard_rules.check(Placement(slot=4, row=2, col=5), sc, {}, set()) is None
+    assert hard_rules.check(Placement(slot=4, row=2, col=6), sc, {}, set()) is None
+    assert hard_rules.check(Placement(slot=4, row=1, col=1), sc, {}, set()) is None
 
 
 def test_economy_first_plants_sunflowers_before_attackers():
@@ -131,7 +132,7 @@ def test_hard_rules_reject_whatever_proposed_it():
     assert "costs 150" in hard_rules.check(Placement(slot=2, row=2, col=2), sc, {}, set())
     rich = scene({2: 2}, sun=500)
     assert hard_rules.check(Placement(slot=2, row=2, col=2), rich, {}, set()) is None
-    assert "no zombie within reach" in hard_rules.check(Placement(slot=2, row=2, col=6), rich, {}, set())
+    assert hard_rules.check(Placement(slot=2, row=2, col=6), rich, {}, set()) is None
     assert "already has" in hard_rules.check(Placement(slot=0, row=1, col=1), rich, {(1, 1): ["sunflower"]}, set())
     assert hard_rules.check(Placement(slot=0, row=1, col=1), rich, {(1, 1): ["lily pad"]}, set()) is None
     assert "not usable" in hard_rules.check(Placement(slot=4, row=1, col=1), sc, {}, set())

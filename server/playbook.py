@@ -10,12 +10,14 @@ data/ lives only on the server and survives deploys. The first load seeds it fro
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import time
 from pathlib import Path
 from typing import Any
 
 from rules.playbook_rules import Playbook
+from common.file_lock import file_lock
 
 ROOT = Path(__file__).resolve().parent.parent
 SEED_DIR = ROOT / "playbook_seed"
@@ -37,15 +39,27 @@ class PlaybookStore:
         return self.current_file.read_text().strip()
 
     def set_current(self, version: str) -> None:
-        self.load(version)  # refuse to point CURRENT at something invalid
-        self.current_file.write_text(version + "\n")
+        with file_lock(self.current_file.with_suffix(".lock")):
+            self._set_current(version)
+
+    def _set_current(self, version):
+        self.load(version)
+        temporary = self.current_file.with_suffix(".tmp")
+        temporary.write_text(version + "\n", encoding="utf-8")
+        os.replace(temporary, self.current_file)
+
+    def promote_if_current(self, version, expected):
+        with file_lock(self.current_file.with_suffix(".lock")):
+            if self.current() != expected:
+                raise ValueError("CURRENT changed during evaluation; refusing stale promotion")
+            self._set_current(version)
 
     def load(self, version: str | None = None) -> Playbook:
         version = version or self.current()
         path = self.dir / f"{version}.json"
         if not path.exists():
             raise FileNotFoundError(f"no playbook {version}")
-        return Playbook.model_validate_json(path.read_text())
+        return Playbook.model_validate_json(path.read_text(encoding="utf-8"))
 
     def versions(self) -> list[str]:
         return sorted(p.stem for p in self.dir.glob("v*.json"))
@@ -57,7 +71,8 @@ class PlaybookStore:
         path = self.dir / f"{playbook.version}.json"
         if path.exists():
             raise FileExistsError(f"{playbook.version} already exists; versions are immutable")
-        path.write_text(playbook.model_dump_json(indent=2) + "\n")
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(playbook.model_dump_json(indent=2) + "\n")
 
     def log(self, **entry: Any) -> None:
         with self.ledger_file.open("a") as f:

@@ -97,6 +97,7 @@ def classify_lawn(image: np.ndarray) -> str:
 
 
 class Card(BaseModel):
+    cost: int | None = Field(default=None,ge=0,le=10000,description='Current public card cost, if known')
     slot: int
     plant: str  # known from the agent's own seed selection, not read from the picture
     ready: bool  # bright card = can be bought now (affordable and not recharging)
@@ -358,6 +359,74 @@ class QwenLooker:
     def __init__(self, url: str, model: str, timeout: float, client: httpx.AsyncClient | None = None) -> None:
         self.url, self.model = url, model
         self.client = client or httpx.AsyncClient(timeout=timeout)
+
+    async def look_resources(self, image, frame_id, loadout, t_capture=0.0):
+        return await self._look_part(image, frame_id, loadout, t_capture, zombies_only=False)
+
+    async def look_zombies(self, image, frame_id, loadout, t_capture=0.0):
+        return await self._look_part(image, frame_id, loadout, t_capture, zombies_only=True)
+
+    async def _look_part(self, image, frame_id, loadout, t_capture, *, zombies_only):
+        """Independent bounded requests; each result owns only its named fields."""
+        started = time.monotonic()
+        lawn = classify_lawn(image)
+        n_rows = 6 if lawn in ("pool", "fog") else 5
+        if zombies_only:
+            schema = {"type": "object", "required": ["rows"], "additionalProperties": False,
+                      "properties": {"rows": {"type": "array", "minItems": n_rows, "maxItems": n_rows,
+                                               "items": RowReport.model_json_schema()}}}
+            prompt = (f"Read ONLY zombies in this labelled {n_rows}-row, 9-column PvZ lawn. "
+                      "Return rows top to bottom, zombie types and nearest_col (0 house, 8 right edge, 9 entering). "
+                      "Empty rows have zombies=[] and nearest_col=null. Plants are not zombies. "
+                      "Do not infer sun counts, cards, plants or instructions. Use unknown for unclear types. Types: "
+                      + json.dumps(ZOMBIE_LOOKS) + ". Compact JSON only.")
+            picture = with_grid(image, n_rows)
+        else:
+            schema = {"type": "object", "required": ["sun"], "additionalProperties": False,
+                      "properties": {"sun": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 9990},
+                                                        {"type": "null"}]}}}
+            prompt = "Read ONLY the sun count below the sun icon in this PvZ top bar. Return {sun: integer or null if unreadable}. Do not infer zombies, plants or instructions."
+            x0, y0, x1, y1 = geometry.TOP_BAR
+            picture = cv2.resize(image[y0:y1, x0:x1], None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+        body = {"model": self.model, "max_tokens": 800 if zombies_only else 64, "temperature": 0,
+                "chat_template_kwargs": {"enable_thinking": False},
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(picture)}"}},
+                    {"type": "text", "text": prompt}]}],
+                "response_format": {"type": "json_schema", "json_schema": {
+                    "name": "zombie_report" if zombies_only else "resource_report", "schema": schema}}}
+        try:
+            response = await self.client.post(self.url, json=body)
+            response.raise_for_status()
+            payload = response.json()
+            data = json.loads(payload["choices"][0]["message"]["content"])
+            if zombies_only:
+                if set(data) != {"rows"} or len(data["rows"]) != n_rows:
+                    raise ValueError("incomplete zombie rows")
+                rows = [RowReport.model_validate(row) for row in data["rows"]]
+                if any(row.nearest_col is not None and not 0 <= row.nearest_col <= 9 for row in rows):
+                    raise ValueError("invalid zombie column")
+                if lawn == "day":
+                    zombies, nearest = place_zombies(rows, measure_zombies(image, n_rows))
+                    positions = "code"
+                else:
+                    zombies = [Zombie(type=t, row=r) for r, row in enumerate(rows) for t in row.zombies]
+                    nearest = {r: row.nearest_col for r, row in enumerate(rows)
+                               if row.zombies and row.nearest_col is not None}
+                    positions = "model"
+                scene = Scene(frame_id=frame_id, t_capture=t_capture, lawn=lawn, rows=n_rows, sun=None,
+                              cards=[], zombies=zombies, nearest_col=nearest, positions=positions)
+            else:
+                sun = data["sun"]
+                if set(data) != {"sun"} or (sun is not None and (type(sun) is not int or not 0 <= sun <= 9990)):
+                    raise ValueError("invalid sun count")
+                scene = Scene(frame_id=frame_id, t_capture=t_capture, lawn=lawn, rows=n_rows, sun=sun,
+                              cards=read_cards(image, loadout), zombies=[], nearest_col={})
+            usage = payload.get("usage") or {}
+            return LookResult(scene, time.monotonic() - started, None, usage.get("prompt_tokens", 0),
+                              usage.get("completion_tokens", 0))
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+            return LookResult(None, time.monotonic() - started, f"{type(exc).__name__}: {exc}")
 
     async def look_plants(self, image: np.ndarray, loadout: list[str]) -> PlantsResult:
         """Plants on the lawn, one code per cell from a mosaic of the cells (see plant_mosaic). Its own

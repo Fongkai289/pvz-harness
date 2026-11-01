@@ -23,7 +23,7 @@ def settings(tmp_path):
         qwen_url="http://qwen.invalid", qwen_model="Qwen3.8-27B",
         decider="rules", onejev_url="http://onejev.invalid", onejev_model="OneJev-27B",
         decider_timeout=1.0,
-        plan_interval=0.2, fast_interval=0.05, pause_for_planner=False,
+        plan_interval=0.2, fast_interval=0.05,
         runs_dir=tmp_path / "runs", data_dir=tmp_path / "data",
         frame_log_interval=0.0, max_run_bytes=10_000_000,
     )
@@ -48,6 +48,54 @@ def test_rejects_bad_token(settings):
         assert msg["code"] == 1008
 
 
+def test_opt_in_client_receives_model_timing_separately_from_commands(settings):
+    settings = replace(settings, look_interval=0.01, plants_interval=0.01, fast_interval=10)
+    client = TestClient(create_app(settings, MockPlanner(delay=0), looker=FakeLooker(settings.loadout)))
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(dumps(Hello(token="secret", client_id="metrics", telemetry=True)))
+        assert json.loads(ws.receive_text())["telemetry"] is True
+        ws.send_bytes(frame_with_sun(1, 300, 250))
+        samples = []
+        while True:
+            sample = json.loads(ws.receive_text())
+            samples.append(sample)
+            if sample.get("status") == "completed":
+                break
+        assert sample["type"] == "model_timing"
+        assert sample["stage"] in {"scene", "plants"}
+        assert sample["latency_ms"] == 10
+        assert sample["error"] is False
+        assert any(s.get("status") == "idle" for s in samples)
+        assert any(s.get("status") == "running" for s in samples)
+        assert sample["call_id"] == 1
+
+
+def test_model_loop_retries_after_unexpected_failure(settings):
+    class RecoveringLooker(FakeLooker):
+        calls = 0
+
+        async def look(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("injected failure")
+            return await super().look(*args, **kwargs)
+
+    settings = replace(settings, look_interval=0.01, plants_interval=10, fast_interval=10)
+    client = TestClient(create_app(settings, MockPlanner(delay=0), looker=RecoveringLooker(settings.loadout)))
+    with client.websocket_connect("/ws") as ws:
+        ws.send_text(dumps(Hello(token="secret", client_id="retry", telemetry=True)))
+        ws.receive_text()
+        ws.send_bytes(frame_with_sun(1, 300, 250))
+        samples = []
+        while True:
+            sample = json.loads(ws.receive_text())
+            samples.append(sample)
+            if sample.get("stage") == "scene" and sample.get("status") == "completed":
+                break
+        assert sample["call_id"] == 2
+        assert any(s.get("status") == "failed" and s.get("call_id") == 1 for s in samples)
+
+
 def test_sun_in_frame_gets_clicked_and_logged(settings):
     client = TestClient(create_app(settings, MockPlanner(delay=0)))
     with client.websocket_connect("/ws") as ws:
@@ -69,15 +117,17 @@ def test_sun_in_frame_gets_clicked_and_logged(settings):
     assert list((settings.runs_dir / session_id / "frames").glob("*.jpg"))
 
 
-def test_pause_for_planner_wraps_the_call(settings):
-    settings = replace(settings, pause_for_planner=True, fast_interval=10.0)
+def test_planner_has_no_input_authority(settings):
+    settings = replace(settings, fast_interval=10.0)
     client = TestClient(create_app(settings, MockPlanner(delay=0.1)))
     with client.websocket_connect("/ws") as ws:
         ws.send_text(dumps(Hello(token="secret", client_id="test")))
-        ws.receive_text()
+        session_id = json.loads(ws.receive_text())["session_id"]
         ws.send_bytes(frame_with_sun(1, 300, 250))
-        actions = [json.loads(ws.receive_text())["action"] for _ in range(2)]
-        assert actions == ["pause", "resume"]
+        time.sleep(.5)
+    events = [json.loads(line) for line in (settings.runs_dir / session_id / "events.jsonl").read_text().splitlines()]
+    assert any(e["kind"] == "plan" for e in events)
+    assert not any(e["kind"] == "cmd" for e in events)
 
 
 class FakeLooker:

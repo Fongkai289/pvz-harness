@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,11 +47,13 @@ class Settings:
     decider_timeout: float
     plan_interval: float
     fast_interval: float
-    pause_for_planner: bool
     runs_dir: Path
     data_dir: Path  # playbooks, CURRENT, ledger; survives deploys
     frame_log_interval: float
     max_run_bytes: int
+    zombies_interval: float = 4.0
+    auto_native_rsi: bool = False
+    native_evolution: str = "strategy"
 
 
 def load_settings(dotenv_path: Path | None = None) -> Settings:
@@ -75,21 +77,38 @@ def load_settings(dotenv_path: Path | None = None) -> Settings:
         loadout=[p.strip() for p in os.environ.get(
             "PVZ_LOADOUT", "peashooter,sunflower,cherry bomb,wall-nut,potato mine,snow pea").split(",") if p.strip()],
         look_interval=float(os.environ.get("PVZ_LOOK_INTERVAL", "4")),
-        plants_interval=float(os.environ.get("PVZ_PLANTS_INTERVAL", "8")),
+        plants_interval=float(os.environ.get("PVZ_PLANTS_INTERVAL", "4")),
+        zombies_interval=float(os.environ.get("PVZ_ZOMBIES_INTERVAL", "4")),
         # Shared model pools on this host (owned by another team; keep traffic low).
         qwen_url=os.environ.get("PVZ_QWEN_URL", "http://127.0.0.1:18201/v1/chat/completions"),
         qwen_model=os.environ.get("PVZ_QWEN_MODEL", "Qwen3.8-27B"),
         decider=os.environ.get("PVZ_DECIDER", "rules"),
-        # 0.8B: ~6 ms per call on 2026-10-28; the 27B pool (18200) ranged 0.03-5.7 s under shared load.
-        onejev_url=os.environ.get("PVZ_ONEJEV_URL", "http://127.0.0.1:18202/v1/systemone"),
-        onejev_model=os.environ.get("PVZ_ONEJEV_MODEL", "OneJev-0.8B"),
-        decider_timeout=float(os.environ.get("PVZ_DECIDER_TIMEOUT", "0.5")),
-        plan_interval=float(os.environ.get("PVZ_PLAN_INTERVAL", "20")),
+        # 27B bare decision API; legacy 0.8B /v1/systemone remains supported explicitly.
+        onejev_url=os.environ.get("PVZ_ONEJEV_URL", "http://127.0.0.1:18220/v1/decide"),
+        onejev_model=os.environ.get("PVZ_ONEJEV_MODEL", "autotrust/JEV-27B-VL"),
+        decider_timeout=float(os.environ.get("PVZ_DECIDER_TIMEOUT", "1.0")),
+        plan_interval=float(os.environ.get("PVZ_PLAN_INTERVAL", "6")),
         fast_interval=float(os.environ.get("PVZ_FAST_INTERVAL", "1.0")),
-        pause_for_planner=_bool("PVZ_PAUSE_FOR_PLANNER", False),
         runs_dir=Path(os.environ.get("PVZ_RUNS_DIR", str(ROOT / "runs"))),
         data_dir=Path(os.environ.get("PVZ_DATA_DIR", str(ROOT / "data"))),
-        frame_log_interval=float(os.environ.get("PVZ_FRAME_LOG_INTERVAL", "1.0")),
+        frame_log_interval=float(os.environ.get("PVZ_FRAME_LOG_INTERVAL", "4.0")),
         # This host evicts the container past 160 GiB of local writes; keep runs small.
         max_run_bytes=int(os.environ.get("PVZ_MAX_RUN_BYTES", str(2 * 1024**3))),
+        auto_native_rsi=_bool("PVZ_AUTO_NATIVE_RSI", True),
+        native_evolution=os.environ.get("PVZ_NATIVE_EVOLUTION", "code"),
     )
+
+
+def effective_settings(settings: Settings, playbook) -> Settings:
+    fields = {"resources_seconds": "look_interval", "zombies_seconds": "zombies_interval",
+              "plants_seconds": "plants_interval", "planner_seconds": "plan_interval",
+              "frame_log_seconds": "frame_log_interval"}
+    return replace(settings, **{target: getattr(playbook.timing, source)
+                               for source, target in fields.items()
+                               if getattr(playbook.timing, source) is not None})
+
+
+def timing_values(settings: Settings) -> dict[str, float]:
+    return {"resources_seconds": settings.look_interval, "zombies_seconds": settings.zombies_interval,
+            "plants_seconds": settings.plants_interval, "planner_seconds": settings.plan_interval,
+            "frame_log_seconds": settings.frame_log_interval}
