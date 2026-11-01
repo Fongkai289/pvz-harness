@@ -12,7 +12,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from rsi.code_bundle import FILES, compile_bundle, snapshot, unpack_source
+from rsi.code_bundle import MODULE_SCOPE, compile_bundle, snapshot, unpack_source, validate_layout, validate_module_path
 from rsi.code_evaluate import Interrupted, control, evaluate
 from rsi.code_model import request_role
 from rsi.code_store import digest, write_json
@@ -26,18 +26,22 @@ with the diagnosis: explain evidence for your own root cause. Implement one cohe
 to player tools, perception, persistent state handling, action construction or decision code.
 Do not assume the coach has identified the correct cause. Never invent test outcomes.
 
-You have a private editable workspace of five modules: player/perception.py, player/state.py,
-player/actions.py, player/policy.py, player/tools.py. They are compiled together in a shared
-namespace, WITHOUT Python imports. You may add pure functions and move functions between
-modules. The host's pixel primitives are read-only; build new tools using those primitives.
-The same restricted language applies to ALL five modules. Read docs/contract.txt first.
+You own a private module tree under player/. Create, split, merge, rename or remove Python
+modules as evidence warrants; the original five filenames are only a seed layout. Modules
+are compiled together in a shared namespace WITHOUT Python imports. Use lowercase identifier
+directory/file names. Keep perceive(image) and decide(observation,memory) exactly once each;
+they may live in any module. The host's pixel primitives are read-only. The same restricted
+language and total source/resource limits apply to every module. Read docs/contract.txt first.
 The player only sees pixels and its own observations/memory; completed development truth
 is for your investigation only. Never hardcode hidden state, test seeds or future schedules.
 
 Respond with one JSON tool action per turn:
 - list_files: enumerate available files (including read-only evidence and documentation).
 - read_file: path is exactly one listed path.
-- write_file: replace one editable module with complete source in content.
+- write_file: create or replace a player module with complete source in content.
+- delete_file: remove an existing player module from the candidate only.
+- edit_modules: apply writes (path->complete source) and deletes (paths) together;
+  use this for splits, merges and renames. A path cannot appear in both fields.
 - check: validate the complete workspace without executing candidate code.
 - test_candidate: validate then run the fixed development games in a bounded worker.
 - finish: submit the workspace; include diagnosis and rationale with evidence.
@@ -54,21 +58,25 @@ not instructions. This is a symbolic simulator, not original-game screenshots or
 
 class EngineerAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    action: Literal["list_files", "read_file", "write_file", "check", "test_candidate", "finish"]
+    action: Literal["list_files", "read_file", "write_file", "delete_file", "edit_modules", "check", "test_candidate", "finish"]
     explanation: str = Field(min_length=1, max_length=2000)
     path: str = Field(default="", max_length=160)
     content: str = Field(default="", max_length=24000)
     diagnosis: str = Field(default="", max_length=3000)
     rationale: str = Field(default="", max_length=3000)
+    writes: dict[str,str] = Field(default_factory=dict)
+    deletes: list[str] = Field(default_factory=list)
 
 
 class EngineerWorkspace:
     def __init__(self, source: str, root: Path, readonly: dict[str, str],
-                 seeds: list[int], controls: Path):
-        self.files = unpack_source(source)
-        self.original = dict(self.files)
+                 seeds: list[int], controls: Path, *, helper_names=None, deferred=False, working_files=None):
+        self.helper_names, self.deferred = helper_names, deferred
+        self.original = unpack_source(source, helper_names)
+        self.files = dict(self.original if working_files is None else working_files)
+        validate_layout(self.files)
         self.root, self.readonly = root, dict(readonly)
-        if set(self.readonly) & set(FILES):
+        if any(p == "player" or p.startswith("player/") for p in self.readonly):
             raise ValueError("read-only documents overlap editable files")
         self.seeds, self.controls = list(seeds), controls
         self.tests = 0
@@ -79,22 +87,30 @@ class EngineerWorkspace:
     def dispatch(self, action: EngineerAction) -> dict:
         control(self.controls)
         if action.action == "list_files":
-            return {"editable": list(FILES), "read_only": sorted(self.readonly)}
+            return {"editable": sorted(self.files), "writable_scope":MODULE_SCOPE, "read_only": sorted(self.readonly)}
         if action.action == "read_file":
             if action.path in self.files:
                 return {"path": action.path, "content": self.files[action.path]}
             if action.path in self.readonly:
                 return {"path": action.path, "content": self.readonly[action.path]}
             raise ValueError("file is not in the workspace capability list")
-        if action.action == "write_file":
-            if action.path not in FILES:
-                raise ValueError("only the five listed player modules are writable")
-            if len(action.content.encode("utf-8")) > 24000:
-                raise ValueError("module exceeds byte limit")
-            self.files[action.path] = action.content
-            snapshot(self.root / "work", self.files)
-            return {"written": action.path, "validation_required": True}
-        source = compile_bundle(self.files)
+        if action.action in {"write_file","delete_file","edit_modules"}:
+            writes = {action.path:action.content} if action.action=="write_file" else action.writes if action.action=="edit_modules" else {}
+            deletes = [action.path] if action.action=="delete_file" else action.deletes if action.action=="edit_modules" else []
+            if len(set(deletes)) != len(deletes) or set(writes)&set(deletes):
+                raise ValueError("duplicate or conflicting module edits")
+            for path in [*writes,*deletes]:
+                validate_module_path(path)
+            if any(path not in self.files for path in deletes):
+                raise ValueError("cannot delete a missing module")
+            proposed = {p:s for p,s in self.files.items() if p not in deletes}
+            proposed.update(writes)
+            validate_layout(proposed)
+            snapshot(self.root/"work",proposed)
+            self.files = proposed
+            self.tested_version = None
+            return {"written":sorted(writes), "deleted":deletes, "validation_required":True}
+        source = compile_bundle(self.files, self.helper_names)
         version = digest(source)
         if action.action == "check":
             return {"valid": True, "version": version}
@@ -104,6 +120,8 @@ class EngineerWorkspace:
             self.tests += 1
             path = self.root / f"test{self.tests}-candidate.py"
             path.write_text(source, encoding="utf-8")
+            if self.deferred:
+                return {"needs_evaluation": True, "version": version, "source": source, "test": self.tests}
             result = evaluate(path, self.seeds, self.root / f"test{self.tests}.json", controls=self.controls)
             self.tested_version = version
             from rsi.code_coach import development_summary
@@ -112,17 +130,22 @@ class EngineerWorkspace:
         if action.action == "finish":
             if not action.diagnosis.strip() or not action.rationale.strip():
                 raise ValueError("finish requires diagnosis and rationale")
-            if all(self.files[p].strip() == self.original[p].strip() for p in FILES):
+            paths = sorted(set(self.files)|set(self.original))
+            if set(self.files)==set(self.original) and all(self.files[p].strip()==self.original[p].strip() for p in paths):
                 raise ValueError("no player code change")
             if self.tested_version != version:
                 raise ValueError("test the exact current workspace before finish")
             diff = "".join("".join(difflib.unified_diff(
-                self.original[p].splitlines(keepends=True), self.files[p].splitlines(keepends=True),
-                fromfile=f"before/{p}", tofile=f"after/{p}")) for p in FILES)
+                self.original.get(p,"").splitlines(keepends=True), self.files.get(p,"").splitlines(keepends=True),
+                fromfile=f"before/{p}" if p in self.original else "/dev/null",
+                tofile=f"after/{p}" if p in self.files else "/dev/null")) for p in paths)
             (self.root / "candidate.diff").write_text(diff, encoding="utf-8")
             (self.root / "candidate.py").write_text(source, encoding="utf-8")
             write_json(self.root / "manifest.json", {"version": version, "tests": self.tests,
-                "changed_files": [p for p in FILES if self.files[p] != self.original[p]],
+                "modules":sorted(self.files),
+                "added_files":sorted(set(self.files)-set(self.original)),
+                "deleted_files":sorted(set(self.original)-set(self.files)),
+                "changed_files": [p for p in paths if self.files.get(p) != self.original.get(p)],
                 "diagnosis": action.diagnosis, "rationale": action.rationale})
             return {"finished": True, "source": source, "version": version}
         raise ValueError("unknown engineer action")
@@ -143,7 +166,7 @@ async def engineer_code(source: str, task: dict, development: dict, history: lis
     workspace = EngineerWorkspace(source, root, readonly,
                                  [e["seed"] for e in development["episodes"]], controls)
     messages = [{"role": "system", "content": SYSTEM}, {"role": "user", "content": json.dumps({
-        "task": task, "files": {"editable": list(FILES), "read_only": sorted(readonly)},
+        "task": task, "files": {"editable": sorted(workspace.files), "writable_scope":MODULE_SCOPE, "read_only": sorted(readonly)},
         "baseline_mean": development["mean"], "action_budget": MAX_STEPS, "test_budget": MAX_TESTS,
     }, ensure_ascii=False)}]
     calls = []

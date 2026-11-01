@@ -15,6 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+native = ["gymnasium==1.3.0", "numpy>=2.2,<3"]
 # Only needed on the Windows game machine.
 client = [
     "mss>=9",

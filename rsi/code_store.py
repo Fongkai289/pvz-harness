@@ -11,6 +11,7 @@ import json
 import os
 import re
 import time
+import uuid
 from pathlib import Path
 
 DOMAIN = "pvzemu-symbolic-v1"
@@ -21,9 +22,14 @@ def digest(source: str) -> str:
 
 
 def write_json(path: Path, value: object) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    # Review queue and research RPC may publish different jobs concurrently.
+    tmp = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with tmp.open("x",encoding="utf-8") as stream:
+            stream.write(json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False)+"\n")
+        os.replace(tmp,path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 class CodeStore:

@@ -46,6 +46,8 @@ def read_episode(runs_dir: Path, session_id: str) -> dict[str, Any]:
     events = [json.loads(line) for line in (runs_dir / session_id / "events.jsonl").read_text().splitlines()]
     end = next(e for e in reversed(events) if e["kind"] == "episode" and e["event"] == "end")
     return {"session": session_id, "playbook": end.get("playbook"), "score": end["summary"]["score"],
+            "score_version": end["summary"].get("score_version"),
+            "mower_evaluation": end["summary"].get("mower_evaluation"),
             "final_state": end["summary"]["final_state"], "diagnostics": diagnose(events)}
 
 
@@ -63,6 +65,8 @@ async def evaluate(version: str, seeds: list[int], *, url: str, token: str, runs
         return {"seed": seed, **episode}
 
     episodes = await asyncio.gather(*(one(s) for s in seeds))
+    if any(ep["score"] is None for ep in episodes):
+        raise ValueError("Incomplete judge data; evaluation cannot promote a candidate")
     scores = {ep["seed"]: ep["score"] for ep in episodes}
     return {"version": version, "game": game, "seeds": seeds, "scores": scores,
             "mean": round(statistics.mean(scores.values()), 4), "episodes": episodes}
@@ -85,6 +89,7 @@ def aggregate_for_coach(report: dict[str, Any]) -> dict[str, Any]:
         "version": report["version"], "game": report.get("game", "suns"), "mean_score": report["mean"],
         "episodes": len(report["episodes"]),
         "totals": totals,
+        "mower_evaluations": [ep["mower_evaluation"] for ep in report["episodes"] if ep.get("mower_evaluation")],
         "clicks": {group: {"count": sum(d["count"] for d in ds),
                            "per_episode_hue": [d["hue"] for d in ds if d["hue"]][:3],
                            "per_episode_area": [d["area"] for d in ds if d["area"]][:3]}

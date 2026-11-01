@@ -67,17 +67,16 @@ def test_diagnose_joins_clicks_with_outcomes():
     assert d["decoy_clicks"]["hue"]["median"] == 33.0
 
 
-def test_decider_option_keys_are_fixed_and_old_versions_load_with_defaults():
+def test_retired_decider_is_discarded_and_old_versions_load_with_defaults():
     base = json.loads(open("playbook_seed/v001.json").read())
     assert "decider" not in base and "planner" not in base
     pb = Playbook.model_validate(base)  # written before those sections existed
-    assert set(pb.decider.criteria) == {"place", "wait"} and pb.planner.knowledge
+    assert "decider" not in pb.model_dump() and pb.planner.knowledge
     assert sorted(pb.jev.priorities) == sorted(["follow_plan", "emergency", "attack", "reinforce", "economy", "wait"])
     with pytest.raises(ValidationError):  # the coach can reorder actions, not rename or drop them
         Playbook.model_validate({**base, "jev": {"priorities": ["attack", "wait"]}})
-    with pytest.raises(ValidationError):
-        Playbook.model_validate({**base, "decider": {"instructions": "Place it now or not?",
-                                                     "criteria": {"yes": "place it", "no": "do not"}}})
+    old = Playbook.model_validate({**base, "decider": {"instructions": "Place it now or not?"}})
+    assert "decider" not in old.model_dump()
 
 
 def test_strategy_knowledge_block_fits_the_rules():
