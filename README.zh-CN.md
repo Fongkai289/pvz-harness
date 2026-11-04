@@ -10,9 +10,9 @@
 Windows 客户端上传截图、执行点击；识图、规划、动作选择与裁判在配置的 Linux 服务器运行。
 可选的 Codex Coach 在 Windows 调用，研究评测协调两端。
 
-**现状（2026-11-04）。** 实时链路能完整打真实对局，包括选卡、收阳光和用铲子。
+**现状（2026-11-04）。** 实时链路能完整打真实对局，包括选卡和收阳光；铲子已接入玩家代码，但还没被用上。
 Portable 训练环境里已不用小推车通过 1-2 到 1-7；实战赢过 1-7 和 1-8。
-还不能说已经能打通冒险模式。
+还不能说已经能打通冒险模式。结果和局限见[技术报告](docs/REPORT.zh-CN.md)。
 
 ## 工作方式
 
@@ -113,6 +113,7 @@ Portable 训练环境里已不用小推车通过 1-2 到 1-7；实战赢过 1-7 
 
 | 文档 | 内容 |
 |---|---|
+| [docs/REPORT.zh-CN.md](docs/REPORT.zh-CN.md) | 技术报告（初稿）：结果、发现与局限 |
 | [docs/PROJECT.md](docs/PROJECT.md) | 项目总览、现状、与绝悟的对比 |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | 架构、数据流、权限 |
 | [docs/HANDOFF_windows.md](docs/HANDOFF_windows.md) | Windows 端开发与运维 |

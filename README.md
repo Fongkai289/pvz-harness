@@ -11,10 +11,10 @@ player code, never model weights.
 The game machine (Windows) is a thin client: it streams screenshots and executes clicks. Vision, planning, action choice and judging run on the configured Linux server. The optional
 Codex Coach worker runs on Windows; research evaluation coordinates both machines.
 
-**Status (2026-11-04).** The live pipeline plays real games end to end, including choosing seeds,
-collecting sun and digging with the shovel. Training on the Portable re-implementation has won
+**Status (2026-11-04).** The live pipeline plays real games end to end, including choosing seeds
+and collecting sun; the shovel is available to the player code but not used yet. Training on the Portable re-implementation has won
 levels 1-2 to 1-7 without lawn mowers; live games have been won on 1-7 and 1-8. There is no claim
-yet that the agent completes the Adventure mode.
+yet that the agent completes the Adventure mode. Results and their limits: [technical report](docs/REPORT.md).
 
 ## How it works
 
@@ -120,6 +120,7 @@ latency does not affect the game. Setup: [docs/portable-rsi.md](docs/portable-rs
 
 | Document | Topic |
 |---|---|
+| [docs/REPORT.md](docs/REPORT.md) | Technical report (draft): results, findings, limitations |
 | [docs/PROJECT.md](docs/PROJECT.md) | Project overview, status, comparison with JueWu (Chinese) |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Architecture, data flow, permissions (Chinese) |
 | [docs/HANDOFF_windows.md](docs/HANDOFF_windows.md) | Windows development and operations |
