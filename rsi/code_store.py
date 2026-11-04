@@ -27,7 +27,15 @@ def write_json(path: Path, value: object) -> None:
     try:
         with tmp.open("x",encoding="utf-8") as stream:
             stream.write(json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False)+"\n")
-        os.replace(tmp,path)
+        for attempt in range(40):
+            try:
+                os.replace(tmp,path)
+                break
+            except PermissionError:
+                # Windows refuses to replace a file another process (the control center) has open for reading.
+                if os.name != "nt" or attempt == 39:
+                    raise
+                time.sleep(0.05)
     finally:
         tmp.unlink(missing_ok=True)
 

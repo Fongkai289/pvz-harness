@@ -36,7 +36,7 @@ client/
   mock_client.py       fake games for testing without Windows: --game suns (sun collecting) | lawn
   fake_lawn.py         drawn, simplified PvZ: cards, sun, plants, six zombie types, eating, mowers, win/lose
   windows_client.py    real client: screenshot capture, input execution and privileged state reporting
-  control_view.py      DPI-aware control dashboard: metrics, model states and four client-only controls
+  app_window.py        the only window: the control center page (8766/client) in a pinned Edge app window
   operator_view.py     read-only planning, review, playbook and game reference tabs
 tests/                 includes an import check that keeps state away from the player side
 ```
@@ -298,6 +298,10 @@ ssh -N -L 8765:127.0.0.1:8765 -p 22 -i <key> operator@server.example.com   # kee
 python -m client.mock_client --token <PVZ_TOKEN> --seconds 30           # any machine
 python -m client.windows_client --token <PVZ_TOKEN>                     # Windows + game
 ```
+
+一键启动（2026-11-03）：双击 `scripts\start_client.cmd`，或在控制中心 `http://127.0.0.1:8766/client` 点「启动客户端」。
+脚本先检查客户端是否已在运行；8765 端口没有隧道时，用 `scripts\connect_server.ps1 -Mode Tunnel` 在最小化窗口里开一条会自动重连的隧道；
+令牌取自 `$env:PVZ_TOKEN` 或用户环境变量 `PVZ_TOKEN`，都没有时在窗口里提示输入（只留在该进程内存，不写文件）；然后启动客户端，窗口即客户端日志。
 
 Windows 控制面板固定四个按钮：**开始 / 暂停 / 继续 / 结束**，只控制客户端。
 “开始”启用识图和决策；“暂停”停止上传、拒绝操作并断开玩家连接；“继续”解除客户端暂停；

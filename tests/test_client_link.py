@@ -65,3 +65,34 @@ def test_network_rtt_uses_websocket_ping_round_trip(monkeypatch):
             pass
         assert link.rtt_ms == 125
     asyncio.run(check())
+
+
+def test_a_slow_link_never_queues_stale_frames():
+    """The next screenshot waits for the server to have the previous one (the pong after it)."""
+    async def check():
+        loop = asyncio.get_running_loop()
+        pongs, grabs, sent = [], [], []
+
+        class WS:
+            async def send(self, data):
+                sent.append(data)
+
+            async def ping(self):
+                pongs.append(loop.create_future())
+                return pongs[-1]
+
+        def grab():
+            grabs.append(len(pongs))
+            return b"jpeg", 800, 600
+
+        link = ServerLink("ws://unused", "test", "test", grab, None, fps=50)
+        task = asyncio.create_task(link._send_frames(WS()))
+        await asyncio.sleep(.2)
+        assert len(sent) == 1 and grabs == [0]  # the network has not delivered frame 1: no frame 2
+        pongs[0].set_result(.1)
+        await asyncio.sleep(.2)
+        assert len(sent) == 2 and grabs == [0, 1]
+        assert link.upload_fps() == 2 / 5
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(check())

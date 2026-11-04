@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hmac
+import json
 import logging
 import re
 import secrets
 import time
 
+import cv2
+import numpy as np
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Header, HTTPException, Request
 
 from common.protocol import Hello, Welcome, dumps, parse_client_message
 from server.config import Settings, load_settings, effective_settings, timing_values
@@ -20,13 +25,14 @@ from server.planner import Planner, make_planner
 from server.playbook import PlaybookStore
 from server.scene import QwenLooker
 from server.session import Session
-from server.live_reviews import LiveReviews
+from server.live_reviews import LiveReviews, needs_improvement
 from server.decision_view import DecisionView
 from server.mechanics import catalog
 
 log = logging.getLogger("pvz.server")
 
 HELLO_TIMEOUT = 10.0
+UPLOAD_PROBE_MAX = 2_000_000  # bytes accepted by the 测试连接 upload probe
 
 
 def create_app(settings: Settings, planner: Planner | None = None,
@@ -65,6 +71,11 @@ def create_app(settings: Settings, planner: Planner | None = None,
                 "selector": settings.decider,
                 "effective_timing": timing_values(effective_settings(settings, book))}
 
+    @app.get("/reviews")
+    async def recent_reviews(limit: int = 8, authorization: str | None = Header(default=None)):
+        authorize(authorization)
+        return reviews.recent(max(1, min(limit, 20)))
+
     @app.get("/reviews/latest")
     async def latest_review(authorization: str | None = Header(default=None)):
         authorize(authorization)
@@ -84,6 +95,61 @@ def create_app(settings: Settings, planner: Planner | None = None,
     async def latest_decisions(authorization: str | None = Header(default=None)):
         authorize(authorization)
         return decisions.latest(app.state.sessions)
+
+    @app.get("/coach/usage")
+    async def coach_usage(authorization: str | None = Header(default=None)):
+        authorize(authorization)
+        from rsi.codex_queue import CoachQueue
+        return {"provider": settings.coach_provider, "model": settings.coach_model,
+                "rounds": await asyncio.to_thread(CoachQueue(settings.coach_queue_dir).dispatch, {"op":"stats"})}
+
+    @app.post("/diagnostics")
+    async def diagnostics(authorization: str | None = Header(default=None)):
+        """控制中心 · 测试连接: one tiny text-only call to each model, timed here on the server."""
+        authorize(authorization)
+        from server.diagnostics import check_models
+        return await check_models(settings)
+
+    @app.post("/diagnostics/upload")
+    async def upload_probe(request: Request, authorization: str | None = Header(default=None)):
+        """Upload bandwidth through the tunnel: the client times sending this body."""
+        authorize(authorization)
+        size = 0
+        async for chunk in request.stream():
+            size += len(chunk)
+            if size > UPLOAD_PROBE_MAX:
+                raise HTTPException(status_code=413, detail="upload probe too large")
+        return {"bytes": size}
+
+    @app.post("/seed_choice")
+    async def seed_choice(body: dict, authorization: str | None = Header(default=None)):
+        """Operator's 选植物: read the chooser screenshot, let Qwen pick, return the packets to click."""
+        authorize(authorization)
+        from server.seed_choice import choose, read_chooser
+        if looker is None:
+            raise HTTPException(status_code=503, detail="选卡需要 Qwen（当前不是 qwen planner）")
+        try:
+            data = base64.b64decode(str(body.get("jpeg", "")), validate=True)
+            if len(data) > 2_000_000:
+                raise ValueError("截图过大")
+            image = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError("截图无法解码")
+            chooser = read_chooser(image)
+        except (ValueError, binascii.Error) as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        try:
+            result = await choose(looker, image, chooser, store.load().planner.knowledge)
+        except Exception as exc:
+            log.exception("seed choice failed")
+            raise HTTPException(status_code=502, detail=f"Qwen 选卡失败：{exc}"[:300])
+        record = {"time": time.time(), "slots": chooser.slots, "available": chooser.available, **result}
+        folder = settings.data_dir / "seed_choices"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{time.strftime('%Y%m%d-%H%M%S')}.json").write_text(json.dumps(record, ensure_ascii=False),
+                                                                     encoding="utf-8")
+        log.info("seed choice: %s (%s)", result["plants"], result["reason"])
+        return result
 
     @app.get("/reviews/{session_id}")
     async def review_status(session_id: str, authorization: str | None = Header(default=None)):
@@ -107,6 +173,8 @@ def create_app(settings: Settings, planner: Planner | None = None,
             "sun_collection": "code-two-frame-v1" if settings.decider == "onejev" else "rules-baseline",
             "mower_evaluation": "mower-time-v1",
             "automatic_coach": True,
+            "coach_provider": settings.coach_provider,
+            "coach_model": settings.coach_model if settings.coach_provider == "codex" else settings.qwen_model,
             "automatic_native_rsi": settings.auto_native_rsi,
             "learning_backend": "pvz_rl",
             "separate_zombie_vision": True,
@@ -176,7 +244,8 @@ def create_app(settings: Settings, planner: Planner | None = None,
                     await task
             session.close()
             if session.completed_outcome:
-                reviews.enqueue(session_id)
+                reviews.enqueue(session_id, improve=needs_improvement(session.completed_outcome,
+                                                                      session.completed_mowers))
             app.state.sessions.pop(session_id, None)
             log.info("session %s closed", session_id)
 

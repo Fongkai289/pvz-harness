@@ -98,6 +98,15 @@ class ArenaProcess:
     def step(self, placement):
         return self.rpc.call('step', placement=placement)
 
+    def shovel(self, cell):
+        return self.rpc.call('shovel', cell=cell)
+
+    def prepare(self, level, seed):
+        return tuple(self.rpc.call('prepare', level=level, seed=seed))
+
+    def choose(self, plants):
+        return self.rpc.call('choose', plants=plants)
+
     def pixels(self):
         import base64
         return base64.b64decode(self.rpc.call('pixels'),validate=True)

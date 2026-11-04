@@ -5,7 +5,11 @@ from server.perception import Observation
 
 COLLECT_INTERVAL = 0.25
 MAX_FRAME_AGE = 0.8
-MAX_CONFIRM_GAP = 0.8
+# A landed sun stays 7.5 s (Coin::GetDisappearTime 750 ticks) and does not move, so two frames up to 2 s
+# apart still confirm it; at the ~1 frame/s of a slow link, 0.8 s left landed suns unpicked for their
+# whole life (2026-11-03). A falling sun moves 0.67 px/tick (67 px/s), past the 40 px match, so it is
+# still picked only once it lands; a sun gone in between costs a harmless click on the lawn.
+MAX_CONFIRM_GAP = 2.0
 
 
 class SunCollector:

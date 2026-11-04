@@ -23,6 +23,40 @@ def catalog():
     return deepcopy(_catalog())
 
 
+def _number(entry, *keys):
+    for key in keys:
+        if isinstance(entry.get(key), (int, float)):
+            return entry[key]
+    return None
+
+
+def player_reference(scene, plants):
+    """Per-species constants for System0 code, so it can turn positions into rough times.
+
+    Full-health values and the fastest listed movement phase; never live HP, timers or positions.
+    Unverified values stay null.
+    """
+    data = _catalog()
+    plant_names = {c.plant for c in scene.cards} | {p for cell in plants for p in cell.get("plants", ())}
+    plant_ref = {}
+    for name in sorted(plant_names):
+        entry = data["plants"].get(name, {})
+        damage, interval = _number(entry, "damage_per_projectile"), _number(entry, "attack_interval_s")
+        damage = damage * (_number(entry, "projectiles_per_attack") or 1) if damage else damage
+        sun, cycle = _number(entry, "sun_per_cycle"), _number(entry, "production_interval_s_approx")
+        plant_ref[name] = {"cost": _number(entry, "sun_cost"), "hp": _number(entry, "full_hp"),
+                           "dps": round(damage / interval, 2) if damage and interval else None,
+                           "sun_per_cycle": sun, "cycle_s": cycle if sun else None}
+    zombie_ref = {}
+    for name in sorted({z.type for z in scene.zombies}):
+        entry = data["zombies"].get(name, {})
+        phases = entry.get("seconds_per_tile")
+        speeds = [v for v in phases.values() if isinstance(v, (int, float))] if isinstance(phases, dict) else []
+        zombie_ref[name] = {"hp": _number(entry, "full_hp"), "chew_dps": _number(entry, "chew_dps"),
+                            "s_per_tile": min(speeds) if speeds else None}
+    return {"plants": plant_ref, "zombies": zombie_ref}
+
+
 def mechanics_context(scene=None, planted=None):
     """Include only relevant species, never infer which damage/phase applies now."""
     data = _catalog()

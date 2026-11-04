@@ -22,7 +22,8 @@
     "mine": "https://plantsvszombies.wiki.gg/wiki/Potato_Mine_%28PvZ%29",
     "wall": "https://plantsvszombies.wiki.gg/wiki/Wall-nut_%28PvZ%29",
     "chomper": "https://plantsvszombies.wiki.gg/wiki/Chomper_%28PvZ%29",
-    "recharge": "https://www.solitairelaboratory.com/solitairearcade/zombies/plantsvszombiesguide.html"
+    "recharge": "https://www.solitairelaboratory.com/solitairearcade/zombies/plantsvszombiesguide.html",
+    "repeater": "https://plantsvszombies.wiki.gg/wiki/Repeater_%28PvZ%29"
   },
   "plants": {
     "peashooter": {"name_zh":"豌豆射手","full_hp":300,"damage_per_projectile":20,"attack_interval_s":1.425,"packet_recharge_s":7.5,"range":"same lane forward","sources":["pea"]},
@@ -31,6 +32,7 @@
     "wall-nut": {"name_zh":"坚果","full_hp":4000,"packet_recharge_s":30,"single_normal_zombie_chew_s_approx":40,"usage":"blocks walking zombies; vaulting, ladders, crushing and theft can bypass durability","sources":["wall","damage"]},
     "potato mine": {"name_zh":"土豆雷","full_hp_unarmed":300,"damage_per_explosion":1800,"arming_s_reference_range":[14,15],"arming_s_planning_margin":15,"packet_recharge_s":30,"range":"contact, small area","usage":"single use; vulnerable before armed; requires lead distance","uncertainty":"The PvZ1 article says both 14 and 15 seconds. Use 15 as a planning reference, not a measured readiness flag.","sources":["mine"]},
     "snow pea": {"name_zh":"寒冰射手","full_hp":300,"damage_per_projectile":20,"attack_interval_s":1.425,"packet_recharge_s_approx":7.5,"movement_multiplier_when_chilled":0.5,"range":"same lane forward","usage":"slowing is conditional on a successful applicable hit; shields and immunity matter","sources":["plants","recharge"]},
+    "repeater": {"name_zh":"双发射手","full_hp":300,"damage_per_projectile":20,"projectiles_per_attack":2,"attack_interval_s":1.425,"packet_recharge_s":7.5,"range":"same lane forward","uncertainty":"The Repeater article says it fires two peas at the Peashooter's rate and rounds that rate to 1.5 s; the Peashooter article gives 1.425 s. Its trivia notes it sometimes fires one pea before two.","sources":["repeater","pea"]},
     "chomper": {"name_zh":"大嘴花","full_hp":300,"digestion_s":42,"packet_recharge_s_approx":7.5,"damage_per_bite_inedible_target":40,"usage":"swallows edible targets; cannot swallow again while digesting; inedible targets are bitten instead","sources":["chomper","recharge"]},
     "tall-nut": {"name_zh":"高坚果","full_hp":8000,"single_normal_zombie_chew_s_approx":80,"usage":"blocks vaulting and pogo; does not prevent every bypass or crushing attack","sources":["plants","damage","zombies"]},
     "pumpkin": {"name_zh":"南瓜头","full_hp":4000,"single_normal_zombie_chew_s_approx":40,"usage":"protective shell; special attacks can bypass ordinary chewing","sources":["damage"]},

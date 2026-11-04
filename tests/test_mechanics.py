@@ -7,7 +7,6 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from client.model_activity import ModelActivity
 from client.operator_view import OperatorView
 from server.app import create_app
 from server.mechanics import DEFAULT_PLANTS, catalog, mechanics_context
@@ -82,15 +81,3 @@ def test_operator_reference_preserves_limits_and_playbook_parameters():
                         "timing": {"danger_replan": True}}, "effective_timing": {"planner_seconds": 6}}
     assert "danger_replan" in view.playbook_text() and "max_actions" in view.playbook_text()
 
-
-def test_model_rows_keep_distinct_states_and_frozen_age():
-    pytest.importorskip("tkinter")
-    from client.control_view import model_row
-    sample = ModelActivity().snapshot("jev")
-    assert model_row(sample)[0] == "未触发"
-    sample.update(status="running", age_s=2.5, count=1, recent_count=1)
-    assert model_row(sample)[1] == "已等待 2.5s"
-    sample.update(status="completed", latency_ms=231)
-    assert model_row(sample)[:2] == ("完成", "231 ms")
-    sample.update(status="failed")
-    assert model_row(sample)[0] == "失败"

@@ -13,16 +13,22 @@ MIN_GAIN = 0.02
 MIN_PAIRS = {"development": 8, "confirmation": 12, "audit": 12}
 CONFIRM_P = 0.05
 GATE_VERSION = "paired-v1"
+# Targeted rounds (training after one level lost or cost a mower): development and confirmation play
+# that level only, the audit replays levels already won mower-free. Same rules, fewer games.
+GATES = {GATE_VERSION: MIN_PAIRS, "targeted-v1": {"development": 6, "confirmation": 6, "audit": 6},
+         # Per-level training: one replay of the level's own game is the Coach's test; no promotion gate.
+         "level-v1": {"development": 1, "confirmation": 1, "audit": 1}}
 
 
-def compare(base: dict, candidate: dict, stage: str) -> dict:
-    if stage not in MIN_PAIRS:
+def compare(base: dict, candidate: dict, stage: str, gate: str = GATE_VERSION) -> dict:
+    if gate not in GATES or stage not in GATES[gate]:
         raise ValueError("unknown promotion stage")
+    min_pairs = GATES[gate]
     left, right = base.get("episodes", []), candidate.get("episodes", [])
     reason = None
     if base.get("error") or candidate.get("error"):
         reason = "evaluation failed"
-    elif len(left) < MIN_PAIRS[stage] or len(left) != len(right):
+    elif len(left) < min_pairs[stage] or len(left) != len(right):
         reason = "insufficient paired episodes"
     elif base.get("environment") != candidate.get("environment"):
         reason = "different evaluation environments"
@@ -35,7 +41,7 @@ def compare(base: dict, candidate: dict, stage: str) -> dict:
              for r in left + right):
         reason = "invalid episode score"
     if reason:
-        return {"passed": False, "stage": stage, "reason": reason, "gate": GATE_VERSION}
+        return {"passed": False, "stage": stage, "reason": reason, "gate": gate}
     differences = [b["score"] - a["score"] for a, b in zip(left, right)]
     gain = sum(differences) / len(differences)
     positive = sum(d > 1e-9 for d in differences)
@@ -58,4 +64,4 @@ def compare(base: dict, candidate: dict, stage: str) -> dict:
     return {"passed": reason is None, "stage": stage, "reason": reason or "passed",
             "gain": round(gain, 6), "positive": positive, "negative": negative,
             "sign_test_p": p, "wins_before": wins_before, "wins_after": wins_after,
-            "gate": GATE_VERSION}
+            "gate": gate}

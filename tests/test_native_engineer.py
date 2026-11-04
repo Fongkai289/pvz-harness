@@ -7,9 +7,8 @@ import time
 import pytest
 
 from rsi.code_bundle import compile_bundle, unpack_source
-from rsi.code_coach import CoachTask
-from rsi.code_engineer import EngineerAction
-from rsi.native_engineer import NativeEngineer
+from rsi.native_engineer import NativeCoachAction, NativeEngineer, book_identity
+from rules.playbook_rules import Playbook
 from rsi.native_jobs import NativeJobs, STEPS, digest
 from rsi.native_player import NativeCodeStore, PlayerRuntime, SEED, execute, player_input
 from rsi.native_bridge import Bridge
@@ -31,8 +30,10 @@ CHANGED = '''def decide(observation, memory):
 
 
 def changed_source():
+    """Context-only code (no options/act/reflex): Jev keeps the built-in placement choice."""
     files = unpack_source(SEED, ())
     files['player/policy.py'] = CHANGED
+    files['player/actions.py'] = ''  # the seed's options/act/reflex live here
     return compile_bundle(files, ())
 
 
@@ -78,23 +79,26 @@ def test_code_store_detects_post_evaluation_modification(tmp_path):
 
 
 @pytest.mark.parametrize('dynamic', [False, True])
-def test_coach_engineer_windows_test_reconnect_repair_finish_and_promotion(settings,monkeypatch,dynamic):
+def test_coach_windows_test_reconnect_repair_finish_and_promotion(settings,monkeypatch,dynamic):
     jobs = NativeJobs(replace(settings,native_evolution='code'))
     job = jobs.enqueue('code-native')
     for _ in range(2): job = jobs.accept(job,report(jobs,job))
     calls=[]
-    edit = EngineerAction(action='edit_modules',explanation='merge and split the seed modules',
+    knowledge = 'Defend the row with the closest zombie before adding sunflowers.'
+    edit = NativeCoachAction(action='edit_modules',explanation='merge and split the seed modules, revise notes',
         writes={'player/vision/input.py':'def perceive(image):\n    return image\n',
-                'player/strategy.py':CHANGED}, deletes=list(unpack_source(SEED, ()))) if dynamic else EngineerAction(
+                'player/strategy.py':CHANGED, 'playbook/planner_knowledge.md': knowledge,
+                'playbook/reflex.json': '{"allow_planting": true, "min_plant_interval_s": 6}'},
+        deletes=list(unpack_source(SEED, ()))) if dynamic else NativeCoachAction(
         action='write_file',explanation='derive threats',path='player/policy.py',content=CHANGED)
     actions=iter([
-        EngineerAction(action='read_file',explanation='read',path='docs/contract.txt'),
+        NativeCoachAction(action='read_file',explanation='read',path='docs/contract.txt'),
         edit,
-        EngineerAction(action='test_candidate',explanation='test'),
-        EngineerAction(action='finish',explanation='submit',diagnosis='observed threats',rationale='tested native code')])
+        NativeCoachAction(action='test_candidate',explanation='test'),
+        NativeCoachAction(action='finish',explanation='submit',diagnosis='observed threats',rationale='tested native code')])
     async def model(role,messages,schema,*args,**kwargs):
         calls.append((role,json.dumps(messages)))
-        if role=='coach': return CoachTask(diagnosis='hypothesis',evidence=['development'],objective='improve'), {'role':role}
+        assert schema is NativeCoachAction
         return next(actions), {'role':role}
     monkeypatch.setattr('rsi.native_engineer.request_role',model)
     monkeypatch.setattr('rsi.code_engineer.evaluate',lambda *a,**k:pytest.fail('Emulator evaluator must never run'))
@@ -105,17 +109,23 @@ def test_coach_engineer_windows_test_reconnect_repair_finish_and_promotion(setti
             job=await driver.advance(jobs.load(job['id']),{'review':'fixture'})
         task=jobs.request(job)
         assert task['engineering_test']==1 and task['book']['player_code']
+        assert task['book']['reflex']['allow_planting'] is dynamic
         assert jobs.store.current()==job['parent'] and job['candidate'] is None
         # Recreate service object: pending Windows evaluation survives disconnect.
         fresh=NativeJobs(jobs.settings)
         assert fresh.request(fresh.load(job['id']))==task
         result=report(fresh,job,.18)
         job=fresh.accept(job,result)
-        assert job['engineering']['tested_version']==task['book']['player_code']
+        assert job['engineering']['tested_version']==book_identity(Playbook.model_validate(task['book']))
         job=await NativeEngineer(fresh).advance(job,None)
         assert job['candidate'] and not job['promoted']
-        assert fresh.store.load(job['candidate']).planner == fresh.store.load(job['parent']).planner
-        assert fresh.store.load(job['candidate']).player_code==task['book']['player_code']
+        candidate, parent = fresh.store.load(job['candidate']), fresh.store.load(job['parent'])
+        if dynamic:
+            assert candidate.planner.knowledge == knowledge and candidate.reflex.min_plant_interval_s == 6
+            assert job['changes']['sections'] == ['planner', 'reflex']
+        else:
+            assert candidate.planner == parent.planner and candidate.reflex == parent.reflex
+        assert candidate.player_code==task['book']['player_code']
         for stage, mode, side in STEPS[2:]:
             job=fresh.accept(job,report(fresh,job,.18 if side=='candidate' else .1))
         assert job['promoted'] and fresh.store.load().player_code==task['book']['player_code']
@@ -125,30 +135,53 @@ def test_coach_engineer_windows_test_reconnect_repair_finish_and_promotion(setti
         assert (await PlayerRuntime(promoted).step(observation()))['jev_context']['observed_threat_rows'] == [4]
         assert 'engineering' not in fresh.latest()
     asyncio.run(run())
-    assert [r for r,_ in calls]==['coach','engineer','engineer','engineer','engineer']
+    assert [r for r,_ in calls]==['coach']*4
     assert all('"seed":' not in messages for _,messages in calls)
+    assert 'postgame_summary' in calls[0][1]
 
 
 def test_unfinished_or_failed_test_cannot_authorize_finish(settings,monkeypatch):
     jobs=NativeJobs(replace(settings,native_evolution='code')); job=jobs.enqueue('failed-test')
     for _ in range(2): job=jobs.accept(job,report(jobs,job))
     actions=iter([
-        EngineerAction(action='write_file',explanation='edit',path='player/policy.py',content=CHANGED),
-        EngineerAction(action='test_candidate',explanation='test'),
-        EngineerAction(action='finish',explanation='submit',diagnosis='guess',rationale='guess')])
+        NativeCoachAction(action='write_file',explanation='edit',path='player/policy.py',content=CHANGED),
+        NativeCoachAction(action='test_candidate',explanation='test'),
+        NativeCoachAction(action='finish',explanation='submit',diagnosis='guess',rationale='guess')])
     async def model(role,*args,**kwargs):
-        if role=='coach': return CoachTask(diagnosis='hypothesis',evidence=['development'],objective='improve'),{}
         return next(actions),{}
     monkeypatch.setattr('rsi.native_engineer.request_role',model)
     async def run():
         nonlocal job
         driver=NativeEngineer(jobs)
-        for _ in range(3): job=await driver.advance(job,{})
+        for _ in range(4): job=await driver.advance(job,{})
         job=driver.feedback(job,error='native executor failed')
         job=await driver.advance(job,None)
         assert job['candidate'] is None and jobs.store.current()==job['parent']
         assert 'exact current' in job['engineering']['messages'][-1]['content']
     asyncio.run(run())
+
+
+def test_coach_playbook_edits_are_validated_and_queries_read_development_games(settings):
+    jobs=NativeJobs(replace(settings,native_evolution='code')); job=jobs.enqueue('queries')
+    for _ in range(2): job=jobs.accept(job,report(jobs,job))
+    job=NativeEngineer(jobs).start(job,{})
+    ws=NativeEngineer(jobs).workspace(job)
+    with pytest.raises(ValueError):
+        ws.dispatch(NativeCoachAction(action='write_file',explanation='bad',path='playbook/reflex.json',
+                                      content='{"allow_planting": true, "min_plant_interval_s": 0.5}'))
+    with pytest.raises(ValueError):
+        ws.dispatch(NativeCoachAction(action='delete_file',explanation='bad',path='playbook/timing.json'))
+    with pytest.raises(ValueError):
+        ws.dispatch(NativeCoachAction(action='write_file',explanation='bad',path='playbook/judge.json',content='{}'))
+    assert ws.book_files == job['engineering']['book_files']
+    listing=ws.dispatch(NativeCoachAction(action='list_files',explanation='list'))
+    assert 'playbook/decision.json' in listing['editable'] and listing['reports']==['pixels','state']
+    found=ws.dispatch(NativeCoachAction(action='find_moments',explanation='q',report='state',kind='long_wait'))
+    assert found['kind']=='long_wait' and isinstance(found['moments'],list)
+    with pytest.raises(ValueError):
+        ws.dispatch(NativeCoachAction(action='find_moments',explanation='q',report='confirmation',kind='mower'))
+    with pytest.raises(ValueError):
+        ws.dispatch(NativeCoachAction(action='query_episode',explanation='q',report='state',episode=0,t_from=0,t_to=99999))
 
 
 def test_executed_candidate_context_reaches_planner_and_jev_but_not_actions(settings,monkeypatch):

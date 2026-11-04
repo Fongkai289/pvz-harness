@@ -21,6 +21,8 @@ from rsi.native_gate import episode_score, SCORE_VERSION
 from rsi.native_jobs import digest, TERMINAL, source_digest
 from rsi.native_runtime import NativeArena, player_state, raw_info, preflight, PLANTS
 from rsi.native_schedule import DecisionClock, DecisionSchedule, timing_summary
+from rsi.postgame import EpisodeRecorder
+from rules.replan_rules import refresh_seconds
 from rsi.native_transport import JsonRPC, ArenaProcess
 
 
@@ -35,6 +37,9 @@ def control(root):
         time.sleep(.2)
     if (root / "STOP").exists():
         raise Stopped("worker explicitly stopped")
+
+
+HEARTBEAT_S = 30  # well inside the server bridge's IDLE_EXIT_S
 
 
 class SSHBridge:
@@ -56,13 +61,27 @@ class SSHBridge:
             import ipaddress
             address = str(ipaddress.IPv4Address(network.stdout.strip()))
             args += ["-b", address]
-        module='rsi.portable_bridge' if config.get('backend')=='pvz_portable' else 'rsi.native_bridge'
+        module = {'pvz_portable': 'rsi.portable_bridge', 'codex_coach': 'rsi.codex_queue'}.get(
+            config.get('backend'), 'rsi.native_bridge')
         args += [ssh["host"], "cd /srv/pvz-harness && .venv/bin/python -u -m "+module]
         self.log = (root / "ssh.log").open("a", encoding="utf-8")
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                                         text=True, encoding="utf-8", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         self.root = root
         self.rpc = JsonRPC(self.process, lambda: control(self.root))
+        # The research bridges and the Coach queue both run native_bridge.serve(), which takes heartbeats.
+        threading.Thread(target=self._heartbeat, daemon=True).start()
+
+    def _heartbeat(self):
+        """One unanswered line every HEARTBEAT_S: a server bridge that stops hearing these has lost us."""
+        while self.process.poll() is None and self.rpc.failure is None:
+            time.sleep(HEARTBEAT_S)
+            try:
+                with self.rpc.writer:
+                    self.process.stdin.write('{"op": "ping"}\n')
+                    self.process.stdin.flush()
+            except (OSError, ValueError):
+                return
 
     def call(self, op, **payload):
         return self.rpc.call(op, **payload)
@@ -79,6 +98,11 @@ class SSHBridge:
         self.log.close()
 
 
+KEY_FRAME_TICKS = 2000  # a live key frame at least every 20 game seconds, plus one per planting
+MAX_KEY_FRAMES = 60
+REFLEX_CALL_TICKS = 100  # research reflex() planting is asked at most once per game second
+
+
 def run_episode(arena, task, spec, bridge, root, schedule=None, abort=None):
     episode_id = uuid.uuid4().hex
     try:
@@ -91,7 +115,15 @@ def run_episode(arena, task, spec, bridge, root, schedule=None, abort=None):
 def _run_episode(arena, task, spec, bridge, root, episode_id, schedule, abort):
     control(root)
     reset_started = time.monotonic()
-    info = arena.reset(spec["level"], spec["seed"])
+    seed_choice = None
+    if hasattr(arena, "prepare"):
+        # Like a player: at the seed chooser the server picks the loadout, then the level starts.
+        offer, info = arena.prepare(spec["level"], spec["seed"])
+        if offer is not None:
+            seed_choice = bridge.call("choose_seeds", job_id=task["job_id"], request_digest=digest(task), **offer)
+            info = arena.choose(seed_choice["plants"])
+    else:
+        info = arena.reset(spec["level"], spec["seed"])
     reset_seconds = time.monotonic()-reset_started
     if info.get("rng_seed_support") != 2 or not info.get("rng_seed_applied"):
         raise RuntimeError("native runtime did not apply the paired RNG seed")
@@ -107,7 +139,11 @@ def _run_episode(arena, task, spec, bridge, root, episode_id, schedule, abort):
     samples['environment_reset_s'].append(reset_seconds)
     decisions, jev_requests, simulation_steps = 0, 0, 0
     choice = None
-    pending_replan = set()
+    key_frames = []  # live view only: player-side boards at each planting and every KEY_FRAME_TICKS
+    recorder = EpisodeRecorder()  # coach-only engine-state record; never sent to the player
+    reflex = (task.get("book") or {}).get("reflex") or {}
+    reflex_interval = int(float(reflex.get("min_plant_interval_s", 4)) * 100)
+    last_reflex_plant, last_reflex_call, reflex_rejected = -10**9, -10**9, 0
     while True:
         if abort is not None and abort.is_set():
             raise RuntimeError('another evaluation lane failed')
@@ -124,18 +160,22 @@ def _run_episode(arena, task, spec, bridge, root, episode_id, schedule, abort):
                 public_loadout = [NAMES[c['plant_type']] for c in raw['cards']]
             else:
                 public_loadout = [PLANTS[c["plant_type"]] for c in sorted(raw["cards"], key=lambda c:c["slot"])]
-        public = player_state(raw, list(info['action_mask']), tick) if task['mode']=='state' else None
+        mask = list(info['action_mask'])
+        public = player_state(raw, mask, tick) if task['mode']=='state' else None
+        try:
+            truth = public if public is not None else player_state(raw, mask, tick)
+        except ValueError:
+            truth = None  # the coach record is incomplete; the game itself continues
+        recorder.observe(tick, truth)
         reasons = clock.due(tick, public)
         if (not reasons and state['plan'] is not None
-                and tick-state['plan_tick'] >= min(clock.schedule.planner_seconds,
-                                                   state['plan'].get('valid_for_seconds',60))*100):
+                and tick-state['plan_tick'] >= refresh_seconds(clock.schedule.planner_seconds,
+                                                               state['plan'].get('valid_for_seconds',60))*100):
             reasons = ['plan_expired']
-        placement = None
+        placement = shovel = None
         if reasons:
-            pending_replan.update(set(reasons) & {'new_threat','threat_advance','plant_lost'})
             payload = dict(job_id=task["job_id"], request_digest=digest(task), tick=tick, episode_id=episode_id,
-                           decision_reasons=reasons, pending_replan_events=sorted(pending_replan),
-                           schedule=clock.schedule.model_dump(), **state)
+                           decision_reasons=reasons, schedule=clock.schedule.model_dump(), **state)
             if public is not None:
                 payload.update(public)
             else:
@@ -148,6 +188,11 @@ def _run_episode(arena, task, spec, bridge, root, episode_id, schedule, abort):
                 write_json(progress_root/(episode_id+'.json'),dict(level=spec['level'],tick=tick,
                     decisions=decisions+1,scene=choice['scene'],plants=choice['plants'],
                     placement=choice['placement'],plan=choice['plan'],timings=choice['timings']))
+                if choice['placement'] or not key_frames or tick-key_frames[-1]['tick']>=KEY_FRAME_TICKS:
+                    key_frames.append(dict(tick=tick,scene=choice['scene'],plants=choice['plants'],
+                                           placement=choice['placement'],plan=(choice.get('plan') or {}).get('objective')))
+                    del key_frames[:-MAX_KEY_FRAMES]
+                    write_json(progress_root/(episode_id+'-frames.json'),dict(level=spec['level'],frames=key_frames))
             samples['rpc_s'].append(time.monotonic()-call_start)
             for key, value in choice['timings'].items():
                 if key.endswith('_s'):
@@ -156,14 +201,36 @@ def _run_episode(arena, task, spec, bridge, root, episode_id, schedule, abort):
             decisions += 1
             reasons_count.update(reasons)
             clock.committed(tick, public, choice.get('schedule'))
-            placement = choice['placement']
+            placement, shovel = choice['placement'], choice.get('shovel')
+            recorder.observe(tick, truth, force=True)
             if choice['plan_tick'] != state['plan_tick']:
-                pending_replan.clear()
+                recorder.plan(tick, choice.get('replan'), (choice.get('lessons') or {}).get('planner'))
+            if choice.get('fallback'):
+                recorder.fallback(tick, choice['fallback'])
+            recorder.decision(tick, choice, placement, source='fallback' if choice.get('fallback') else 'jev')
             state = {key:choice[key] for key in state}
+        if (placement is None and choice is not None and choice.get('reflex_planting')
+                and tick - last_reflex_plant >= reflex_interval and tick - last_reflex_call >= REFLEX_CALL_TICKS):
+            last_reflex_call = tick
+            # player_code reflex() planting between decisions (research games collect suns themselves).
+            payload = dict(job_id=task["job_id"], request_digest=digest(task), tick=tick, episode_id=episode_id,
+                           plan=state['plan'], spent=state['spent'])
+            if public is not None:
+                payload.update(public)
+            answer = bridge.call("reflex", **payload)
+            proposed = answer.get('placement')
+            if proposed is not None:
+                if mask[1 + proposed['slot']*54 + proposed['row']*9 + proposed['col']]:
+                    placement, last_reflex_plant, state['spent'] = proposed, tick, answer['spent']
+                    recorder.decision(tick, {**choice, 'decision': None}, placement, source='reflex')
+                else:
+                    reflex_rejected += 1  # not legal in the engine now; never sent
         control(root)  # Pause/stop arriving during model inference must prevent a new action.
         if abort is not None and abort.is_set():
             raise RuntimeError('another evaluation lane failed')
         step_start = time.monotonic()
+        if shovel is not None:
+            arena.shovel(shovel)  # dig first, so a plant of the same decision can use the cell
         terminal, truncated, info = arena.step(placement)
         samples['environment_step_s'].append(time.monotonic()-step_start)
         simulation_steps += 1
@@ -181,10 +248,12 @@ def _run_episode(arena, task, spec, bridge, root, episode_id, schedule, abort):
         for row in rows:
             if row in mowers:
                 raise RuntimeError("duplicate mower event")
+            recorder.mower(int(info["game_clock"])-initial_clock, row)
             precise=events.get('mower_trigger_ticks',{})
             mowers[row] = float(precise.get(str(row),precise.get(row,elapsed*100)))/100
         point = {"tick":tick, "scene":choice["scene"], "plants":choice["plants"],
-                 "plan":choice["plan"], "placement":placement, "timings":choice["timings"] if reasons else {},
+                 "plan":choice["plan"], "placement":placement, "shovel":shovel,
+                 "timings":choice["timings"] if reasons else {},
                  "mower_triggered_rows":rows, "system0":choice.get("system0"),
                  "decision_reasons":reasons, "decision_observation_tick":clock.last_tick}
         if public is not None:
@@ -205,8 +274,10 @@ def _run_episode(arena, task, spec, bridge, root, episode_id, schedule, abort):
                     "mower_times":list(mowers.values()), "elapsed_game_s":elapsed, "progress":progress,
                     "wall_s":time.monotonic()-started, "model_errors":0,"invalid_actions":0,
                     "throughput":dict(decisions=decisions,jev_requests=jev_requests,simulation_steps=simulation_steps,
-                                      triggers=dict(reasons_count),timings=timing_summary(samples)),
-                    "trace":trace,"milestones":milestones}
+                                      triggers=dict(reasons_count),timings=timing_summary(samples),
+                                      reflex_rejected_by_engine=reflex_rejected),
+                    "trace":trace,"milestones":milestones,"postgame":recorder.report(),
+                    "seed_choice":seed_choice}
 
 
 def evaluate_task(config, task, bridge, *, arena_factory=NativeArena):
@@ -271,8 +342,10 @@ def evaluate_task(config, task, bridge, *, arena_factory=NativeArena):
                 arena.close()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(lane, i, missing[i::workers]) for i in range(workers)]
-        for future in futures:
-            future.result()
+        failures = [f.exception() for f in futures if f.exception() is not None]
+    # Lanes stopped by abort only echo the failure; report the one that actually went wrong.
+    if failures:
+        raise next((e for e in failures if str(e) != 'another evaluation lane failed'), failures[0])
     elapsed_wall = max(time.monotonic()-started, .000001)
     result = {"request_digest":digest(task), "version":task["version"],
             "environment":{**identity, "backend":config.get('backend','pvz_rl'), "mode":task["mode"], "score_version":SCORE_VERSION,

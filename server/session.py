@@ -2,8 +2,10 @@
 
 Concurrent loops run per session:
   look / plants: screenshot -> scene and plant matrix (code + Qwen)
-  fast  (every fast_interval s): sun clicks; Jev chooses plant/row/column under current guidance
-  sun   (every 0.25 s): independently collect pixel-confirmed suns, serialized with planting
+  fast  (every fast_interval s): Jev chooses plant/row/column, or a named decision from
+        player_code's menu that its act() carries out, under current guidance
+  sun   (every 0.25 s): player_code reflex() (sun pickups, optional gated planting) or, without
+        one, the host's own pickup of pixel-confirmed suns; serialized with planting
   plan  (every plan_interval s): planner updates objectives, priorities and budgets, never placements
 """
 
@@ -28,26 +30,37 @@ from common.protocol import (
 from rules.playbook_rules import Playbook
 from server.config import Settings, effective_settings
 from rules.hard_rules import PLANT_COSTS
-from server.action_selector import ActionSelector, DecisionContext, candidates, blocked_reasons
+from server.action_selector import (LESSONS_CONTRACT, ActionSelector, DecisionContext, candidates, blocked_reasons,
+                                    reject_actions)
+from server.action_gate import (MenuItem, PlantAction, ShovelAction, SunAction, parse_actions, parse_menu,
+                                split_actions)
 from server.judge import Judge
-from server.perception import Observation, Perception, decode_jpeg
+from server.perception import Blob, Observation, Perception, decode_jpeg
 from server.planner import Placement, Planner, Plan, PlanResult
-from server.policy import FastPolicy
+from server.policy import Click, FastPolicy
 from server.sun_collector import SunCollector, COLLECT_INTERVAL
 from server.runlog import RunLog
 from server.scene import QwenLooker, Scene
-from server.threats import observed_threats, threat_changes
+from server.lessons import active_lessons
+from server.seed_packets import UNKNOWN, CardMemory, known_plants
+from server.shovel import find_shovel
+from server.threats import observed_threats
+from rules.replan_rules import event_spacing, plan_lifetime, refresh_seconds
 
 log = logging.getLogger(__name__)
 
 STALE_FRAME_SECONDS = 2.0  # stop acting when no fresh frame arrived for this long
+REFLEX_TIMEOUT = 0.15  # seconds for a warm player_code reflex() call
+REFLEX_MAX_TIMEOUTS = 5  # consecutive timeouts before reflexes are off for the rest of the episode
 
 
 class Session:
     def __init__(self, ws: WebSocket, settings: Settings, planner: Planner, selector: ActionSelector,
                  playbook: Playbook, session_id: str, looker: QwenLooker | None = None) -> None:
         self.ws = ws
+        self.base_settings = settings
         self.settings = effective_settings(settings, playbook)
+        self._book_level = None  # Adventure level whose playbook this episode uses (None: as connected)
         self.planner = planner
         self.selector = selector
         self.looker = looker  # Jev always needs observed state, even with an image-based planner
@@ -68,7 +81,7 @@ class Session:
         self.seen_plants: dict[tuple[int, int], list[str]] = {}
         self.seen_plants_frame = -1
         self.plants_received = 0.0
-        self.placed_since: list[tuple[int, int, int, str]] = []  # (frame_id, row, col, plant)
+        self.placed_since: list[tuple[int, int, int, str | None]] = []  # (frame_id, row, col, plant or None = dug up)
         self.used_slots: set[int] = set()  # cards used since the latest scene was taken
         self.sun_spent = 0
         self.session_id = session_id
@@ -81,12 +94,23 @@ class Session:
         self.latest_obs: Observation | None = None
         self.latest_jpeg: bytes | None = None
         self.latest_recv = 0.0
+        self._frame_arrived = asyncio.Event()  # replaced on every frame, so each waiter wakes once
         self.paused = False
         self._cmd_id = 0
         self._send_lock = asyncio.Lock()
         self._action_lock = asyncio.Lock()
         self.sun_collector = SunCollector()
         self._sun_permit = None
+        self._reflex_permit = None
+        self._reflex_timeouts = 0
+        self._reflex_disabled = False
+        self._last_reflex_plant = float("-inf")
+        self._fallback = None  # {plan, reasons, since, plants}: System0 said this plan no longer fits
+        self._fallback_permit = None
+        self._lesson_errors = set()
+        self.card_memory = CardMemory()  # the seed bank as recognized on screen, per level
+        self._last_fallback_plant = float("-inf")
+        self._menu: list[MenuItem] = []
         self._sun_processed_frame = -1
         self._sun_clicks_sent = 0
         self._selected_context: DecisionContext | None = None
@@ -97,11 +121,13 @@ class Session:
         self._planner_started = None
         self._jev_blocked = {}
         self.completed_outcome = None
+        self.completed_mowers = None  # lawn mowers used in the completed game, from the same read-only result
         self.threat_rows = []
         self._plan_requested = asyncio.Event()
         self._plan_reasons = {}
         self._active_plan_reasons = []
-        self._resource_snapshot = None
+        self._plan_id = 0
+        self._plan_failures = 0  # consecutive Jev decisions under the current plan that could not be carried out
         self._planning_context = None
         self.player_runtime = None
         self._code_epoch = None
@@ -115,6 +141,8 @@ class Session:
         header, jpeg = unpack_frame(data)
         obs = self.perception.process(header, decode_jpeg(jpeg))
         self.latest_obs, self.latest_jpeg, self.latest_recv = obs, jpeg, time.monotonic()
+        self._frame_arrived.set()
+        self._frame_arrived = asyncio.Event()
         self.sun_collector.observe(obs, self.latest_recv)
         self.runlog.maybe_save_frame(header.frame_id, jpeg)
         self.runlog.event(
@@ -127,6 +155,9 @@ class Session:
         if isinstance(msg, StateMsg):
             self.judge.on_state(msg)
             self.runlog.event("state", t=msg.t, frame_id=msg.frame_id, data=msg.data)
+            level = (msg.data or {}).get("level")
+            if type(level) is int and 1 <= level <= 50 and level != self._book_level:  # 0 while a level loads
+                self._use_level_book(level)
         elif isinstance(msg, ExecReport):
             self.runlog.event("exec", **msg.model_dump(exclude={"type"}))
         elif isinstance(msg, EpisodeEvent):
@@ -139,6 +170,14 @@ class Session:
                 self.episode_active = msg.event == "start"
                 self.sun_collector = SunCollector()
                 self._sun_processed_frame = -1
+                self._reflex_timeouts = 0
+                self._reflex_disabled = False
+                self._last_reflex_plant = float("-inf")
+                self._fallback = None
+                self._last_fallback_plant = float("-inf")
+                self._lesson_errors = set()
+                self.card_memory.reset()  # another level may have other cards
+                self._menu = []
                 self.directive = None
                 self.latest_scene = None
                 self.latest_zombies = None
@@ -154,11 +193,12 @@ class Session:
                 self._plan_requested.clear()
                 self._plan_reasons.clear()
                 self._active_plan_reasons = []
-                self._resource_snapshot = None
+                self._plan_failures = 0
                 self._planning_context = None
                 self._planner_started = None
                 if msg.event == "start":
                     self.latest_obs = None  # no screenshot from the previous episode may start a new plan
+                    self._book_level = None  # training may have changed the level's playbook since
             summary = self.judge.on_episode(msg)
             if msg.event == "end" and summary:
                 final = summary.get("final_state") or {}
@@ -166,6 +206,7 @@ class Session:
                         and final.get("outcome") in {"win", "lose"}
                         and final.get("outcome_source") == "goty-1096-readonly-result"):
                     self.completed_outcome = final["outcome"]
+                    self.completed_mowers = final.get("mowers_used")
             self.runlog.event("episode", event=msg.event, level=msg.level, summary=summary,
                               playbook=self.playbook.version)
             if msg.event == "end" and self.latest_obs and self.latest_jpeg:
@@ -178,7 +219,18 @@ class Session:
     async def send(self, action: str, obs: Observation | None = None, meta: dict | None = None,
                    **fields) -> Command | None:
         async with self._send_lock:
-            if (meta or {}).get("decision_source") == "sun_collector":
+            source = (meta or {}).get("decision_source")
+            if source == "system0_fallback":
+                # Fallback planting: only the exact clicks compiled from a gated, hard-rule-checked placement.
+                permit = self._fallback_permit
+                if permit is None or permit[0] is not obs or action != "click" or fields != permit[1]:
+                    raise PermissionError("Fallback planting requires an exact gated placement permit")
+            elif source == "system0_reflex" and fields.get("reason") != "collect sun":
+                # Reflex planting: only the exact clicks compiled from a gated, hard-rule-checked placement.
+                permit = self._reflex_permit
+                if permit is None or permit[0] is not obs or action != "click" or fields != permit[1]:
+                    raise PermissionError("Reflex planting requires an exact gated placement permit")
+            elif source in {"sun_collector", "system0_reflex"}:
                 # A label cannot authorize arbitrary coordinates: only the collector's
                 # exact current target, while it owns the action lock, is permitted.
                 permit = self._sun_permit
@@ -252,6 +304,15 @@ class Session:
             return None
         return self.latest_obs
 
+    async def _next_frame(self, arrived: asyncio.Event, timeout: float) -> float:
+        """A look skipped for want of a fresh frame retries when the next one lands, not at its next tick:
+        when frames come slower than STALE_FRAME_SECONDS, fixed ticks keep falling between them."""
+        try:
+            await asyncio.wait_for(arrived.wait(), timeout)
+        except TimeoutError:
+            pass
+        return time.monotonic()
+
     async def look_loop(self) -> None:
         if self.looker is None:
             return
@@ -259,15 +320,18 @@ class Session:
         while True:
             await asyncio.sleep(max(0, due - time.monotonic()))
             due = time.monotonic() + self.settings.look_interval
+            arrived = self._frame_arrived
             obs, jpeg = self._fresh_obs(), self.latest_jpeg
             if obs is None or jpeg is None or self.paused:
                 await self.report_model_state("scene", "idle", reason="等待新画面或暂停解除")
+                due = await self._next_frame(arrived, self.settings.look_interval)
                 continue
             generation = self.episode_generation
             frame_received = self.latest_recv
             reader = self.looker.look_resources if self.split_vision else self.looker.look
-            look = await self._call_model("scene", lambda: reader(
-                decode_jpeg(jpeg), obs.frame_id, self.settings.loadout, obs.t_capture))
+            image = decode_jpeg(jpeg)
+            cards = self.card_memory.observe(image)  # which plant each seed slot shows, from the screenshot
+            look = await self._call_model("scene", lambda: reader(image, obs.frame_id, cards, obs.t_capture))
             if look is None:
                 continue
             # The look step's own record: the judge can check it against ground truth, field by field.
@@ -287,14 +351,9 @@ class Session:
         self.scene_received = frame_received  # inference latency does not make an old image fresh
         # Do not erase commands issued while this screenshot was being analysed.
         newer = [p for p in self.placed_since if p[0] >= scene.frame_id]
-        self.used_slots = {self.settings.loadout.index(p[3]) for p in newer
-                           if p[3] in self.settings.loadout}
+        names = [card.plant for card in scene.cards]
+        self.used_slots = {names.index(p[3]) for p in newer if p[3] in names}
         self.sun_spent = sum(PLANT_COSTS.get(p[3], 0) for p in newer)
-        snapshot = {"sun": scene.sun, "usable_and_affordable": [c.plant for c in scene.cards
-                    if c.ready and scene.sun is not None and PLANT_COSTS.get(c.plant, 99999) <= scene.sun]}
-        if self._resource_snapshot is not None and snapshot != self._resource_snapshot and self.directive is not None:
-            self._request_replan({"resources": "阳光或可用卡片发生变化；请用最新资源重新判断旧预算建议"})
-        self._resource_snapshot = snapshot
         self._update_threats()
 
     async def zombies_loop(self):
@@ -304,13 +363,15 @@ class Session:
         while True:
             await asyncio.sleep(max(0, due - time.monotonic()))
             due = time.monotonic() + self.settings.zombies_interval
+            arrived = self._frame_arrived
             obs, jpeg = self._fresh_obs(), self.latest_jpeg
             if obs is None or jpeg is None or self.paused:
                 await self.report_model_state("zombies", "idle", reason="等待新画面或暂停解除")
+                due = await self._next_frame(arrived, self.settings.zombies_interval)
                 continue
             generation, received = self.episode_generation, self.latest_recv
             result = await self._call_model("zombies", lambda: self.looker.look_zombies(
-                decode_jpeg(jpeg), obs.frame_id, self.settings.loadout, obs.t_capture))
+                decode_jpeg(jpeg), obs.frame_id, list(self.card_memory.names), obs.t_capture))
             if result is None:
                 continue
             self.runlog.event("zombies", frame_id=obs.frame_id, latency=result.latency, error=result.error,
@@ -338,14 +399,13 @@ class Session:
                 self.runlog.maybe_save_frame(self.latest_obs.frame_id, self.latest_jpeg, force=True)
 
     def _update_threats(self):
+        """Observed threat rows are Planner/Jev context; whether they need a new plan is System0's call."""
         if self.latest_scene is None or self._zombie_block_reason():
             return
         rows = observed_threats(self.latest_scene, self.lawn(), self._layout_fresh())
-        changes = threat_changes(self.threat_rows, rows)
         if rows != self.threat_rows:
             self.runlog.event("threats", rows=rows, frame_id=self.latest_scene.frame_id)
         self.threat_rows = rows
-        self._request_replan(changes)
 
     def _zombie_block_reason(self):
         if not self.split_vision:
@@ -366,13 +426,17 @@ class Session:
         while True:
             await asyncio.sleep(max(0, due - time.monotonic()))
             due = time.monotonic() + self.settings.plants_interval
+            arrived = self._frame_arrived
             obs, jpeg = self._fresh_obs(), self.latest_jpeg
             if obs is None or jpeg is None or self.paused:
                 await self.report_model_state("plants", "idle", reason="等待新画面或暂停解除")
+                due = await self._next_frame(arrived, self.settings.plants_interval)
                 continue
             generation = self.episode_generation
             frame_received = self.latest_recv
-            seen = await self._call_model("plants", lambda: self.looker.look_plants(decode_jpeg(jpeg), self.settings.loadout))
+            # Lawn plants are named from the recognized cards (all known card art before the first look).
+            names = [n for n in self.card_memory.names if n != UNKNOWN] or known_plants()
+            seen = await self._call_model("plants", lambda: self.looker.look_plants(decode_jpeg(jpeg), names))
             if seen is None:
                 continue
             self.runlog.event("plants", frame_id=obs.frame_id, latency=seen.latency, error=seen.error,
@@ -388,10 +452,13 @@ class Session:
                 self._update_threats()
 
     def lawn(self) -> dict[tuple[int, int], list[str]]:
-        """The lawn as last seen, plus what the agent placed after that snapshot."""
+        """The lawn as last seen, plus what the agent placed (or dug up) after that snapshot, in order."""
         cells = {cell: list(plants) for cell, plants in self.seen_plants.items()}
         for frame_id, row, col, plant in self.placed_since:
             if frame_id < self.seen_plants_frame:
+                continue
+            if plant is None:  # shovel
+                cells.pop((row, col), None)
                 continue
             cell = cells.setdefault((row, col), [])
             if plant not in cell:
@@ -409,34 +476,71 @@ class Session:
                 for click in self.policy.tick(obs):
                     await self.send("click", obs, meta={**click.meta, "decision_source": "rules"},
                                     x=click.x, y=click.y, reason=click.reason)
-            place = await self._jev_step(obs)
-            if place is not None:
-                await self._execute_placement(place)
+            decision = await self._jev_step(obs)
+            if decision is not None:
+                await self._execute_placement(*decision)
 
-    async def _execute_placement(self, place: Placement) -> None:
+    async def _execute_placement(self, place: Placement | None, shovel: ShovelAction | None = None) -> None:
         # A planner budget replacement cannot split the select-card/click-cell pair.
         async with self._action_lock:
             latest, selected = self._decision_context(), self._selected_context
             if (latest is None or selected is None or latest.directive is not selected.directive
-                    or latest.scene is not selected.scene or latest.reject(place) is not None):
+                    or latest.scene is not selected.scene or reject_actions(latest, place, shovel) is not None):
                 return
             obs = self._fresh_obs()
+            if shovel is not None:
+                clicks = self._shovel_clicks(shovel)
+                if clicks is None:
+                    return  # the shovel left its box since the look; neither half runs
+                for click in clicks:
+                    await self.send("click", obs, meta={**click.meta, **self._decision_authority()},
+                                    x=click.x, y=click.y, reason=click.reason)
+                self._record_shovel(obs, shovel)
+            if place is None:
+                return
             # Only compile the selected placement; never sneak sun clicks into this pair.
             for click in self.policy.tick(Observation(obs.frame_id, obs.t_capture), place=place):
                 await self.send("click", obs, meta={**click.meta, **self._decision_authority()},
                                 x=click.x, y=click.y, reason=click.reason)
-            card = latest.scene.cards[place.slot].plant
-            self.placed_since.append((obs.frame_id, place.row, place.col, card))
-            self.used_slots.add(place.slot)
-            self.sun_spent += PLANT_COSTS[card]
-            self.directive_spent += PLANT_COSTS[card]
+            self._record_placement(obs, latest.scene, place)
+
+    def _shovel_clicks(self, shovel: ShovelAction) -> list[Click] | None:
+        """Pick up the shovel from where the latest frame shows it, then click the plant's cell."""
+        x0 = find_shovel(decode_jpeg(self.latest_jpeg)) if self.latest_jpeg else None
+        if x0 is None:
+            self.runlog.event("shovel", row=shovel.row, col=shovel.col, rejected="no shovel in the latest frame")
+            return None
+        return self.policy.shovel_clicks(x0, shovel.row, shovel.col)
+
+    def _record_shovel(self, obs: Observation, shovel: ShovelAction) -> None:
+        self.placed_since.append((obs.frame_id, shovel.row, shovel.col, None))
+        self.runlog.event("shovel", frame_id=obs.frame_id, row=shovel.row, col=shovel.col, rejected=None)
+
+    def _record_placement(self, obs: Observation, scene: Scene, place: Placement) -> None:
+        card = scene.cards[place.slot].plant
+        self.placed_since.append((obs.frame_id, place.row, place.col, card))
+        self.used_slots.add(place.slot)
+        self.sun_spent += PLANT_COSTS[card]
+        self.directive_spent += PLANT_COSTS[card]
 
     def _decision_context(self) -> DecisionContext | None:
         if self._decision_block_reason():
             return None
-        return DecisionContext(self.latest_scene, self.lawn(), set(self.used_slots), self.directive,
+        planted = self.lawn()
+        return DecisionContext(self.latest_scene, planted, set(self.used_slots), self.directive,
                                self.sun_spent, self.directive_spent,
-                               layout_fresh=self._layout_fresh(), strategy_knowledge=self.playbook.planner.knowledge)
+                               layout_fresh=self._layout_fresh(), strategy_knowledge=self.playbook.planner.knowledge,
+                               lessons=self._lessons(planted))
+
+    def _lessons(self, planted):
+        scene = self.latest_scene
+        shown, errors = active_lessons(self.playbook.lessons, scene, planted,
+                                       None if scene.sun is None else scene.sun - self.sun_spent)
+        for lesson, error in errors.items():
+            if lesson not in self._lesson_errors:  # once per lesson per episode
+                self._lesson_errors.add(lesson)
+                self.runlog.event("lesson_error", lesson=lesson, error=error)
+        return shown
 
     def _layout_fresh(self):
         return self.looker is None or (self.seen_plants_frame >= 0 and
@@ -449,7 +553,86 @@ class Session:
         while True:
             await asyncio.sleep(COLLECT_INTERVAL)
             if self.settings.decider == "onejev":
-                await self._collect_suns()
+                if self._reflex_active():
+                    await self._reflex()
+                else:
+                    await self._collect_suns()
+
+    async def _reflex(self):
+        """player_code reflex(): choose sun pickups and, if the playbook allows, one gated plant.
+
+        Any error, invalid output or timeout falls back to the host's own pickup this tick.
+        """
+        obs = self._fresh_obs()
+        if self.paused or obs is None or obs.frame_id <= self._sun_processed_frame:
+            return
+        confirmed = self.sun_collector.targets(obs)
+        clicks = self.policy.sun_candidates(Observation(obs.frame_id, obs.t_capture, confirmed))
+        reflex = self.playbook.reflex
+        ctx = self._decision_context() if reflex.allow_planting and self.settings.system0_actions else None
+        may_plant = ctx is not None and time.monotonic() - self._last_reflex_plant >= reflex.min_plant_interval_s
+        if not clicks and not may_plant:
+            return
+        if self.latest_scene is None:
+            return await self._collect_suns()
+        generation = self.episode_generation
+        try:
+            targets = [Blob(c.x, c.y, int(c.meta.get("area", 0)), float(c.meta.get("hue", 0.0))) for c in clicks]
+            observation = self._system0_observation(ctx if may_plant else None, suns=targets)
+            raw = await self._system0("reflex", observation=observation, warm_timeout=REFLEX_TIMEOUT)
+            actions = parse_actions(raw, "reflex", suns=len(clicks), allow_planting=may_plant)
+            self._reflex_timeouts = 0
+        except Exception as exc:
+            if isinstance(exc, TimeoutError):
+                self._reflex_timeouts += 1
+                if self._reflex_timeouts >= REFLEX_MAX_TIMEOUTS:
+                    self._reflex_disabled = True
+            self.runlog.event("system0_error", entry="reflex", error=f"{type(exc).__name__}: {exc}"[:300],
+                              code=self.playbook.player_code, reflex_disabled=self._reflex_disabled)
+            return await self._collect_suns()
+        if generation != self.episode_generation:
+            return
+        async with self._action_lock:
+            if self.paused or self._fresh_obs() is not obs or obs.frame_id <= self._sun_processed_frame:
+                return
+            self._sun_processed_frame = obs.frame_id
+            sent, plant, rejected = 0, None, None
+            for action in actions:
+                if isinstance(action, SunAction):
+                    click = clicks[action.index]
+                    self._sun_permit = (obs, click)
+                    try:
+                        cmd = await self.send("click", obs, meta={**click.meta, "decision_source": "system0_reflex",
+                                              "rule": "two_frame_confirmation"},
+                                              x=click.x, y=click.y, reason="collect sun")
+                    finally:
+                        self._sun_permit = None
+                    if cmd is not None:
+                        self.policy.mark_sun_clicked(click)
+                        sent += 1
+                elif isinstance(action, PlantAction):
+                    plant = Placement(slot=action.slot, row=action.row, col=action.col)
+                    latest = self._decision_context()
+                    rejected = "decision context unavailable" if latest is None else latest.reject(plant)
+                    if rejected is None:
+                        for click in self.policy.tick(Observation(obs.frame_id, obs.t_capture), place=plant):
+                            fields = {"x": click.x, "y": click.y, "reason": click.reason}
+                            self._reflex_permit = (obs, fields)
+                            try:
+                                await self.send("click", obs, meta={**click.meta, "decision_source": "system0_reflex"},
+                                                **fields)
+                            finally:
+                                self._reflex_permit = None
+                        self._record_placement(obs, latest.scene, plant)
+                        self._last_reflex_plant = time.monotonic()
+            self._sun_clicks_sent += sent
+            self.runlog.event("sun_collection", frame_id=obs.frame_id, detected=len(obs.suns),
+                              confirmed=len(confirmed), clicks_sent=sent, total_clicks=self._sun_clicks_sent,
+                              decision_source="system0_reflex",
+                              reason="已下发拾取" if sent else "reflex 未选择阳光" if clicks else "未发现阳光")
+            if plant is not None:
+                self.runlog.event("reflex_plant", frame_id=obs.frame_id, placement=plant.model_dump(),
+                                  rejected=rejected)
 
     async def _collect_suns(self):
         async with self._action_lock:
@@ -489,13 +672,14 @@ class Session:
             return reason
         if self.directive is None:
             return "等待Planner首次规划"
-        if now - self.directive_received >= self.directive.valid_for_seconds:
+        if now - self.directive_received >= plan_lifetime(self.directive.valid_for_seconds):
             return "Planner指令已过期，等待重新规划"
         if now - self.scene_received > max(5.0, 2 * self.settings.look_interval):
             return "识图结果已过期，等待Qwen刷新"
         return ""
 
-    async def _jev_step(self, obs: Observation) -> Placement | None:
+    async def _jev_step(self, obs: Observation) -> tuple[Placement | None, ShovelAction | None] | None:
+        """The accepted decision: an optional dig, then an optional plant; None waits."""
         self._selected_context = None
         ctx = self._decision_context()
         if ctx is None:
@@ -514,12 +698,64 @@ class Session:
                 return None
             ctx.tool_context = derived["jev_context"]
             if derived["request_replan"]:
-                self._plan_requested.set()
+                reasons = derived["planner_context"].get("replan_reasons")
+                reasons = [str(r)[:200] for r in reasons][:6] if isinstance(reasons, list) and reasons else ["unspecified"]
+                self._request_replan({"system0:" + r: r for r in reasons})
+                if self._fallback_enabled() and (self._fallback or {}).get("plan") != self._plan_id:
+                    self._fallback = {"plan": self._plan_id, "reasons": reasons, "since": time.monotonic(), "plants": []}
+                    self.runlog.event("fallback_start", plan_id=self._plan_id, reasons=reasons)
+            if self._fallback_window():
+                if await self._fallback_step(ctx):
+                    return None
+                ctx.tool_context = {**ctx.tool_context, "plan_no_longer_fits": self._fallback["reasons"]}
         available = candidates(ctx)
         self._jev_blocked = {} if available else blocked_reasons(ctx)
         decision_id = None
-        if self.settings.decider == "onejev" and available:
-            selected = await self._call_model("jev", lambda: self.selector.select(ctx, self.playbook.jev))
+        menu_log = None
+        shovel = None
+        if self._menu_active() and available:
+            # Named decisions: player_code lists them, Jev picks one, player_code's act() places it.
+            generation = self.episode_generation
+            observation = self._system0_observation(ctx)
+            try:
+                menu = parse_menu(await self._system0("options", observation=observation), ctx.scene.rows or 5)
+            except Exception as exc:
+                self.runlog.event("system0_error", entry="options", error=f"{type(exc).__name__}: {exc}"[:300],
+                                  code=self.playbook.player_code)
+                return None
+            if generation != self.episode_generation or self.latest_scene is not ctx.scene:
+                return None
+            self._menu = menu
+            if not menu:
+                await self.report_model_state("jev", "idle", reason="决策菜单为空")
+                self.runlog.event("jev", frame_id=obs.frame_id, scene_frame=ctx.scene.frame_id, decision_id=None,
+                                  action="wait", reason="empty decision menu", menu=[], guidance=ctx.directive.model_dump())
+                return None
+            selected = await self._call_model("jev", lambda: self.selector.select_menu(
+                ctx, menu, ctx.directive.preferred_decisions))
+            if selected is None:
+                return None
+            decision_id = self._model_calls["jev"]
+            menu_log = {"menu": [item.public() for item in menu],
+                        "decision": selected.decision.public() if selected.decision else None}
+            if selected.decision is not None and not selected.error:
+                try:
+                    actions = parse_actions(await self._system0("act", observation=observation,
+                                            decision=selected.decision.call_argument()), "act", suns=0)
+                except Exception as exc:
+                    actions = []
+                    menu_log["act_error"] = f"{type(exc).__name__}: {exc}"[:300]
+                menu_log["act"] = [vars(a) for a in actions]
+                shovel, plant = split_actions(actions)
+                if plant is not None:
+                    selected.placement = Placement(slot=plant.slot, row=plant.row, col=plant.col)
+                if not actions:
+                    menu_log["decision_unexecutable"] = True
+        elif self.settings.decider == "onejev" and available:
+            if self.playbook.decision.jev_mode == "flat":
+                selected = await self._call_model("jev", lambda: self.selector.select(ctx, self.playbook.jev, mode="flat"))
+            else:
+                selected = await self._call_model("jev", lambda: self.selector.select(ctx, self.playbook.jev))
             if selected is None:
                 return None
             decision_id = self._model_calls["jev"]
@@ -535,24 +771,32 @@ class Session:
             rejected = "no successful Jev authorization"
         elif latest is None or latest.directive is not ctx.directive or latest.scene is not ctx.scene:
             rejected = "decision context changed or expired during Jev call"
-        elif place is not None:
-            rejected = latest.reject(place)
+        elif place is not None or shovel is not None:
+            rejected = reject_actions(latest, place, shovel)
+        acting = place is not None or shovel is not None
+        if (menu_log or {}).get("decision_unexecutable") or (acting and rejected and latest is not None
+                and latest.directive is ctx.directive and latest.scene is ctx.scene):
+            self._plan_failures += 1
+        elif acting and not rejected:
+            self._plan_failures = 0
         self.runlog.event("jev", frame_id=obs.frame_id, scene_frame=ctx.scene.frame_id,
-                          decision_id=decision_id,
-                          action="plant" if place else "wait", reason=selected.reason,
+                          decision_id=decision_id, **(menu_log or {}),
+                          action=("shovel+plant" if shovel and place else "shovel" if shovel
+                                  else "plant" if place else "wait"), reason=selected.reason,
                           selector_source=selected.source, selector_latency=selected.latency,
                           selector_error=selected.error, scores=selected.scores,
-                          blocked_reasons=self._jev_blocked,
+                          blocked_reasons=self._jev_blocked, lessons=[l["id"] for l in ctx.lessons],
                           guidance=ctx.directive.model_dump(), budget_spent=ctx.directive_spent,
                           decision_context={"scene": ctx.scene.model_dump(),
                               "plants": [{"row": r, "col": c, "plants": ps} for (r,c),ps in sorted(ctx.planted.items())],
                               "sun_spent_since_scene": ctx.sun_spent, "used_slots": sorted(ctx.used_slots),
                               "system0_derived_context":ctx.tool_context,
                               "layout_fresh": ctx.layout_fresh, "budget_advice": ctx.budget_message()},
-                          placement=place.model_dump() if place else None, rejected=rejected)
+                          placement=place.model_dump() if place else None,
+                          shovel=vars(shovel) if shovel else None, rejected=rejected)
         if not rejected:
             self._selected_context = ctx
-        return None if rejected else place
+        return None if rejected or not acting else (place, shovel)
 
     def _plan_delay(self) -> float:
         """Refresh before expiry, allowing for measured inference time; never extend a lease."""
@@ -562,8 +806,8 @@ class Session:
         lead = max(1.0, self._planner_latency * 1.5)
         since_start = (time.monotonic() - self._planner_started
                        if self._planner_started is not None else age)
-        return max(0.25, min(self.settings.plan_interval - since_start,
-                             self.directive.valid_for_seconds - age - lead))
+        return max(0.25, min(refresh_seconds(self.settings.plan_interval, self.directive.valid_for_seconds) - since_start,
+                             plan_lifetime(self.directive.valid_for_seconds) - age - lead))
 
     async def plan_loop(self) -> None:
         while True:
@@ -573,11 +817,15 @@ class Session:
                 pass
             self._plan_requested.clear()
             if self._planner_started is not None:
-                spacing = min(self.settings.plan_interval, self.playbook.timing.danger_min_seconds)
+                spacing = event_spacing(self.playbook.timing.danger_min_seconds)
                 await asyncio.sleep(max(0, spacing - (time.monotonic() - self._planner_started)))
+            arrived = self._frame_arrived
             obs, jpeg = self._fresh_obs(), self.latest_jpeg
             if obs is None or jpeg is None or self.paused:
                 await self.report_model_state("plan", "idle", reason="等待新画面或暂停解除")
+                # Still due (an event or the refresh), so retry on the next frame rather than the next refresh.
+                await self._next_frame(arrived, max(1.0, self._plan_delay()))
+                self._plan_requested.set()
                 continue
             if self.looker is not None and self.latest_scene is None:
                 await self.report_model_state("plan", "idle", reason="等待识图完成")
@@ -586,6 +834,7 @@ class Session:
                 await self.report_model_state("plan", "idle", reason=reason)
                 continue
             generation = self.episode_generation
+            trigger = ("initial" if self.directive is None else "system0" if self._plan_reasons else "periodic")
             self._active_plan_reasons = list(self._plan_reasons.values())
             self._plan_reasons.clear()
             try:
@@ -601,7 +850,7 @@ class Session:
                 "plan", frame_id=obs.frame_id, mode=self.settings.planner_mode, latency=result.latency,
                 error=result.error, request_id=result.request_id, input_tokens=result.input_tokens,
                 output_tokens=result.output_tokens, plan=result.plan.model_dump() if result.plan else None,
-                trigger_reasons=self._active_plan_reasons,
+                trigger=trigger, trigger_reasons=self._active_plan_reasons,
                 observed_context=self._planning_context,
             )
             if result.plan is not None and generation == self.episode_generation:
@@ -611,6 +860,9 @@ class Session:
                         self.directive_received = time.monotonic()
                         self.directive_spent = 0
                         self.plan_note = result.plan.note
+                        self._end_fallback()
+                        self._plan_id += 1
+                        self._plan_failures = 0
 
     async def _plan(self, obs: Observation, jpeg: bytes) -> PlanResult:
         knowledge = self.playbook.planner.knowledge
@@ -629,13 +881,28 @@ class Session:
                    "jev_blocked_reasons": self._jev_blocked}
         context["observed_threats"] = self.threat_rows
         context["replan_reasons"] = self._active_plan_reasons
+        if lessons := self._lessons(self.lawn()):
+            context["lessons_now"] = lessons
+            context["lessons_contract"] = LESSONS_CONTRACT
         if self.player_runtime:
             derived = await self._system0()
             context["system0_derived_context"] = derived["planner_context"]
+        if self._menu_active():
+            context["decision_menu"] = [item.public() for item in self._menu]
+            context["decision_menu_note"] = "Latest named decisions offered to Jev; it may change as the lawn changes."
         self._planning_context = {"scene": self.latest_scene.model_dump(), "context": context}
         return await self.planner.decide(self.latest_scene, knowledge, reference, context=context)
 
-    async def _system0(self):
+    def _menu_active(self) -> bool:
+        return (self.player_runtime is not None and self.player_runtime.has_menu
+                and self.settings.decider == "onejev" and self.playbook.decision.jev_mode == "auto")
+
+    def _reflex_active(self) -> bool:
+        return (self.player_runtime is not None and "reflex" in self.player_runtime.entries
+                and not self._reflex_disabled)
+
+    def _system0_observation(self, ctx: DecisionContext | None = None, suns=(), pixels=False, status=False):
+        """Player-side input for every System0 entry; legality only from the hard rules."""
         from rsi.native_player import player_input
         scene = self.latest_scene
         if self.paused or not self.episode_active or scene is None:
@@ -643,9 +910,128 @@ class Session:
         if self._code_epoch is None:
             self._code_epoch = scene.t_capture
         plants = [{"row":r,"col":c,"plants":ps} for (r,c),ps in self.lawn().items()]
-        result = await self.player_runtime.step(player_input(scene,plants,self.directive,self.directive_spent,
-                        max(0,int((scene.t_capture-self._code_epoch)*100)),self.latest_jpeg))
-        self.runlog.event("system0",code=self.playbook.player_code,frame_id=scene.frame_id,result=result)
+        legal = None if ctx is None else [(p.slot, p.row, p.col) for p in candidates(ctx)]
+        return player_input(scene, plants, self.directive, self.directive_spent,
+                            max(0,int((scene.t_capture-self._code_epoch)*100)),
+                            self.latest_jpeg if pixels else None, legal=legal, suns=suns,
+                            sun_available=None if scene.sun is None else scene.sun - self.sun_spent,
+                            plan_status=self._plan_status() if status else None)
+
+    def _use_level_book(self, level):
+        """Play this level's own playbook (server/level_books.py), as training does; CURRENT if it has none.
+
+        The level number is what the game shows the player; it only selects the playbook.
+        """
+        from rsi.native_player import NativeCodeStore, PlayerRuntime
+        from server.level_books import LevelBooks
+        from server.playbook import PlaybookStore
+        self._book_level = level
+        store = PlaybookStore(self.base_settings.data_dir)
+        try:
+            version = LevelBooks(self.base_settings.data_dir).version(store, level)
+            if version == self.playbook.version:
+                self.runlog.event("level_playbook", level=level, version=version, previous=version, switched=False)
+                return
+            book = store.load(version)
+            source = NativeCodeStore(self.base_settings.data_dir).source(book.player_code) if book.player_code else None
+        except Exception as exc:
+            self.runlog.event("level_playbook_error", level=level, error=f"{type(exc).__name__}: {exc}"[:300])
+            return
+        previous, self.playbook = self.playbook, book
+        self.settings = effective_settings(self.base_settings, book)
+        if book.player_code != previous.player_code:
+            if self.player_runtime:
+                self.player_runtime.close()
+            self.player_runtime = PlayerRuntime(source) if source else None
+            self._reflex_disabled = False
+            self._reflex_timeouts = 0
+        self.runlog.event("level_playbook", level=level, version=book.version, previous=previous.version, switched=True)
+
+    def _plan_status(self):
+        if self.directive is None:
+            return None
+        return {"id": self._plan_id, "age_s": round(time.monotonic() - self.directive_received, 1),
+                "failed_steps": self._plan_failures,
+                "fallback_reasons": self._fallback["reasons"] if self._fallback_window() else []}
+
+    def _fallback_enabled(self) -> bool:
+        return (self.player_runtime is not None and "fallback" in self.player_runtime.entries
+                and self.playbook.fallback.allow_planting and self.settings.system0_actions
+                and self.playbook.timing.danger_replan)
+
+    def _fallback_window(self) -> bool:
+        return self._fallback is not None and self._fallback["plan"] == self._plan_id and self._fallback_enabled()
+
+    def _end_fallback(self):
+        if self._fallback is not None and self._fallback["plan"] == self._plan_id:
+            self.runlog.event("fallback_end", plan_id=self._plan_id, reasons=self._fallback["reasons"],
+                              duration_s=round(time.monotonic() - self._fallback["since"], 1),
+                              plants=self._fallback["plants"])
+        self._fallback = None
+
+    async def _fallback_step(self, ctx: DecisionContext) -> bool:
+        """Player code plants in Jev's place while the plan no longer fits; False hands this step to Jev."""
+        if time.monotonic() - self._last_fallback_plant < self.playbook.fallback.min_plant_interval_s:
+            return True
+        generation = self.episode_generation
+        try:
+            observation = self._system0_observation(ctx, status=True)
+            actions = parse_actions(await self._system0("fallback", observation=observation), "fallback", suns=0)
+        except Exception as exc:
+            self.runlog.event("system0_error", entry="fallback", error=f"{type(exc).__name__}: {exc}"[:300],
+                              code=self.playbook.player_code)
+            return False
+        if generation != self.episode_generation or not self._fallback_window():
+            return True
+        await self.report_model_state("jev", "idle", reason="方针已失效，代码接管直到新方针")
+        plant, rejected = None, None
+        shovel, planted = split_actions(actions)
+        async with self._action_lock:
+            latest = self._decision_context()
+            if planted is not None:
+                plant = Placement(slot=planted.slot, row=planted.row, col=planted.col)
+            if plant is not None or shovel is not None:
+                if latest is None or latest.directive is not ctx.directive or latest.scene is not ctx.scene:
+                    rejected = "decision context changed or expired during fallback call"
+                else:
+                    rejected = reject_actions(latest, plant, shovel)
+            if (plant is not None or shovel is not None) and rejected is None:
+                obs = self._fresh_obs()
+                clicks = [] if shovel is None else self._shovel_clicks(shovel)
+                if clicks is None:
+                    rejected = "no shovel in the latest frame"
+                else:
+                    if plant is not None:
+                        clicks += self.policy.tick(Observation(obs.frame_id, obs.t_capture), place=plant)
+                    for click in clicks:
+                        fields = {"x": click.x, "y": click.y, "reason": click.reason}
+                        self._fallback_permit = (obs, fields)
+                        try:
+                            await self.send("click", obs, meta={**click.meta, "decision_source": "system0_fallback"},
+                                            **fields)
+                        finally:
+                            self._fallback_permit = None
+                    if shovel is not None:
+                        self._record_shovel(obs, shovel)
+                    if plant is not None:
+                        self._record_placement(obs, latest.scene, plant)
+                        self._fallback["plants"].append(plant.model_dump())
+                    self._last_fallback_plant = time.monotonic()
+        self.runlog.event("fallback", plan_id=self._plan_id, scene_frame=ctx.scene.frame_id,
+                          reasons=self._fallback["reasons"],
+                          action=("shovel+plant" if shovel and plant else "shovel" if shovel
+                                  else "plant" if plant else "wait"),
+                          placement=plant.model_dump() if plant else None,
+                          shovel=vars(shovel) if shovel else None, rejected=rejected)
+        return True
+
+    async def _system0(self, entry="decide", *, observation=None, decision=None, warm_timeout=None):
+        if observation is None:
+            observation = self._system0_observation(pixels=True, status=entry == "decide")
+        frame = self.latest_scene.frame_id if self.latest_scene else None
+        result = await self.player_runtime.step(observation, entry, decision, warm_timeout)
+        if entry != "reflex":  # reflex results are logged with what the gate did with them
+            self.runlog.event("system0", entry=entry, code=self.playbook.player_code, frame_id=frame, result=result)
         return result
 
     def close(self) -> None:

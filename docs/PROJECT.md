@@ -7,7 +7,7 @@
 
 用通用大模型玩《植物大战僵尸》（PvZ GOTY 1.2.0.1096，Steam）：Windows 游戏机只负责截图和点击，
 远程服务器上的 Qwen 看图、Planner 定方针、OneJev（Jev）选具体种什么种在哪；
-赛后由 Coach / Engineer 两个模型角色改策略文本或「System0」代码，经固定多局评测通过才晋升。
+赛后由一个 Coach 模型角色改 playbook（策略文本、计时、Jev 模式、反射设置）和「System0」代码，经固定多局评测通过才晋升。
 
 截至本文：
 
@@ -47,7 +47,7 @@
 | `client/windows_client.py` | 真实客户端：窗口查找、截图、点击、只读状态、控制台生命周期 |
 | `client/menu.py` | 用 `docs/screens/` 参考图识别菜单/暂停/结束画面，只读，不点菜单 |
 | `client/mower_state.py` | 只读内存：小推车状态、游戏时钟、胜负（仅英文 GOTY 1.2.0.1096） |
-| `client/control_view.py`、`operator_view.py`、`model_activity.py` | Tk 控制台：指标、五路模型状态、规划/复盘/策略/图鉴页签 |
+| `client/app_window.py`、`panel_bridge.py`、`operator_view.py`、`model_activity.py` | 控制窗口：游戏旁置顶的 Edge 应用窗口，显示控制中心客户端页；状态经 8767 桥接，指标、五路模型状态、规划/复盘/策略/图鉴 |
 | `client/mock_client.py`、`fake_lawn.py` | 无需 Windows 的假游戏：伪阳光、简化草坪（6 种僵尸、小推车、胜负） |
 | `server/session.py` | 一个连接的全部循环与执行检查（核心，655 行） |
 | `server/scene.py` | 识图：代码读卡片亮度/草坪类型/僵尸位置，Qwen 读阳光、僵尸种类、植物矩阵（格子拼图） |
@@ -108,12 +108,17 @@ Jev 被阻原因、逐行威胁事实、重规划原因、System0 派生上下�
 
 输出 `Plan`（pydantic 严格校验）：`objective`、`priorities ⊂ {defense, economy, reinforce, save_sun}`、
 `priority_rows / blocked_rows`、`sun_reserve`、`spend_limit`、`budget_policy`、`tactics`、`threat_assessment`、
-`valid_for_seconds`（5–120）。模式拒绝任何卡槽和坐标，也就是 Planner 不能直接下种植指令。
+`valid_for_seconds`（5–120，宿主按不短于 15 s 处理）、`preferred_decisions`（System0 菜单里的 id，只是建议）、
+`replan_when`（已覆盖的行和僵尸类型、依赖的现有植物、目标植物数量、目标清空的行、连续几次落不了地算失效）。
+只有 System0 按 `replan_when` 请求或定时刷新时才再次调用 Planner，两次至少隔 8 s（`rules/replan_rules.py`）。
+模式拒绝任何卡槽和坐标，也就是 Planner 不能直接下种植指令。
 
 ### 3.5 Jev（`server/action_selector.py`）
 
 1. `candidates()` 枚举所有 卡槽 × 行 × 列，经 `DecisionContext.reject()` 过滤（硬规则 + 布局新鲜 + 阳光/费用已知）。
-2. 分层模式：先在「wait + 每个（植物, 行）」里选，再在该组的列里选（含 wait）；flat 模式一次从全部动作里选。
+2. 菜单模式（System0 定义了 `options`/`act`，且 `decision.jev_mode=auto`）：Jev 从「wait + 有名字的决策」里选一个，
+   System0 的 `act()` 落成具体格子，再过硬规则。否则用内置选择：分层模式先在「wait + 每个（植物, 行）」里选，
+   再在该组的列里选（含 wait）；flat 模式一次从全部动作里选。
 3. 给 Jev 的 state 是一段 JSON 文字：方针、预算建议、策略知识、System0 上下文、当前可用阳光、逐行威胁事实、局面、图鉴参数。
    Jev 永远不收图片。
 4. 两次请求共用一个总超时 `PVZ_DECIDER_TIMEOUT`（默认 1 s）。出错、超时、格式不对一律等待，不偷偷换规则兜底。
@@ -126,10 +131,15 @@ Jev 被阻原因、逐行威胁事实、重规划原因、System0 派生上下�
 
 ### 3.7 System0（playbook.player_code）
 
-Engineer 写的受限 Python（`rsi/code_runtime.py` 自定义子集：无 import、无属性访问、无 while、24000 字符、
-64 KiB 记忆、16 KiB 输出，隔离进程 + 超时）。入口 `perceive(image)`、`decide(observation, memory)`，
-返回 `planner_context`、`jev_context`、`request_replan`。它只能给模型补充计算出的上下文，不能直接点击。
-真实客户端在连接时加载 playbook 绑定的代码版本；当前真实 CURRENT 没有绑定代码。
+教练写的受限 Python（`rsi/code_runtime.py` 自定义子集：无 import、无属性访问、无 while、24000 字符、
+64 KiB 记忆、16 KiB 输出，隔离进程 + 超时）。它是执行层加反射层：
+- `perceive` / `decide`：给 Planner、Jev 补计算出的上下文；按方针的 `replan_when` 判断要不要重规划；
+- `options` / `act`：列 Jev 的决策菜单，把 Jev 选中的决策落成一次种植；
+- `reflex`：每 0.25 s 选收哪些已确认的阳光，playbook 允许时再种一株；
+- `fallback`：`decide` 请求重规划后、新方针到达前，代替 Jev 直接种植（`fallback.allow_planting` 打开时；
+  实战另有总开关 `PVZ_SYSTEM0_ACTIONS`）。
+所有动作都经 `server/action_gate.py`（动作类型、数量、阳光只能按编号引用）和硬规则检查；出错就等待或退回宿主收阳光。
+真实客户端在连接时加载 playbook 绑定的代码版本。2026-11-03 起实战和训练的 CURRENT 都是 v010：挂种子玩家代码、`fallback.allow_planting=true`（人工修改，未经晋升评测）。
 
 ### 3.8 裁判与评分
 
@@ -139,7 +149,7 @@ Engineer 写的受限 Python（`rsi/code_runtime.py` 自定义子集：无 impor
 
 ### 3.9 日志与控制台
 
-`runs/<session>/events.jsonl` 记录每次规划、Jev 打分/选择/延迟/拒绝原因、收阳光、模型状态；
+`runs/<session>/events.jsonl` 记录每次规划、Jev 打分/选择/延迟/拒绝原因、决策菜单与落地结果、收阳光、反射种植、模型状态；
 普通截图每 4 s 存一张，危险和终局另存，总量有上限（服务器容器写满 160 GiB 会被驱逐）。
 `/playbook`、`/reviews/*`、`/learning/latest`、`/decisions/latest`、`/mechanics` 均需 Bearer 令牌。
 
@@ -153,16 +163,17 @@ Engineer 写的受限 Python（`rsi/code_runtime.py` 自定义子集：无 impor
 | 参数 RSI `rsi/loop.py` | 伪阳光游戏（mock_client） | perception/fast 等字段，一次一个改动 | 跑过：v001→v003，留出集 0.153→0.955（只是收阳光） |
 | 赛后复盘 `rsi/review_live.py` | 真实对局日志 | 只写诊断和改进目标，不改策略 | 可用，胜负确认后自动触发 |
 | 代码进化 `rsi/code_loop.py` | PvZ-Emulator + 程序化渲染 | 玩家模块（感知+决策）代码 | 已停用；唯一晋升来自外部 Codex 候选 |
-| pvz_rl `rsi/native_*` | yych00/pvz_rl 原版游戏接口 | System0 代码目录（可增删模块） | 接线完成并部署；缺 1.2.0.1065 游戏，未跑过 |
+| pvz_rl `rsi/native_*` | yych00/pvz_rl 原版游戏接口 | System0 代码目录（可增删模块）+ playbook 的策略笔记/计时/Jev 模式/反射设置 | 接线完成；缺 1.2.0.1065 游戏，未跑过 |
 | Portable `rsi/portable_*` | PvZ-Portable（用 Steam 资源编译的开源重写），1-1～1-10 | 同上 | 1-1 首次 Jev 调用 ConnectError，未完成任何一局 |
 
 ### 4.1 自动闭环（pvz_rl / Portable 共用）
 
 ```
 真实对局结束 → LiveReview 复盘 → 服务器持久队列 → Windows 执行器跑基线
- → Coach 读开发集，提出一个有证据的任务（不写代码）
- → Engineer 用工具读源码/改 player/ 模块/检查/请求 Windows 测试/修复（≤12 个动作、≤2 次开发测试）
- → 只能提交「最后一次测过」的精确版本
+ → 赛后表：代价最大时刻、错失机会、决策统计、Planner→Jev 对齐率（rsi/postgame.py）
+ → 一个 Coach：读证据、查开发局（query_episode / find_moments）、改 playbook 文件和 player/ 模块、
+   检查、请求 Windows 测试、修复（默认 ≤20 个动作、≤2 次开发测试，可配置）
+ → 只能提交「最后一次测过」的精确组合（代码 + playbook 段）
  → 固定评测：开发 8 对（≥60% 场景变好，均分 +0.02）
             → 新种子确认 12 对（均分 +0.02，单侧符号检验 p≤0.05）
             → 截图条件审计 12 对（不退步）
@@ -174,16 +185,18 @@ Jev 默认每 2 游戏秒、Planner 每 20 游戏秒，事件可提前触发；w
 
 ### 4.2 Playbook
 
-`data/playbooks/vNNN.json` 不可变，`data/CURRENT` 指当前版本（真实客户端 v009），研究环境各有独立 CURRENT。
-字段：`perception`、`fast`、`jev`（仅规则基线用）、`planner.knowledge`、`timing`、`notes`、`player_code`。
+`data/playbooks/vNNN.json` 不可变，`data/CURRENT` 指当前版本（2026-11-03 起 v010）。Portable 训练的 `data/portable_study/CURRENT` 与实战同步：任一边晋升的版本复制到另一边（`rsi/book_sync.py`）。
+2026-11-03 起每关可以有自己的 playbook（`levels.json`，`server/level_books.py`），由按关卡训练产生并同步到实战；实战每局按游戏显示的关卡号选用，没有就用 CURRENT（见 portable-rsi.md）。
+字段：`perception`、`fast`、`jev`（仅规则基线用）、`planner.knowledge`、`lessons`（条件经验：条件成立时才发给
+Planner/Jev，见 ARCHITECTURE.md 4.6）、`timing`、`decision`、`reflex`、`fallback`、`notes`、`player_code`。
 人工修改走 `python -m rsi.human_edit --set section.field=JSON --note ...`，同样校验并记入账本。
 
 ## 5. 部署与运维
 
 - 部署：`powershell -File scripts\deploy.ps1 -Test`（打包 → scp → 服务器替换代码保留 .env/.venv/runs/logs/data → uv sync → pytest → 重启 tmux pvz → 健康检查）。
-  另有 `deploy_native_rsi.py`、`deploy_portable.py` 做增量部署并先备份到 `/srv/operator/pvz-backups/`。
+  另有 `deploy_native_rsi.py`、`deploy_portable.py` 做增量部署并先备份到 `/srv/pvz-harness/data/deploy_backups/`。
 - 连接：`scripts/connect_server.ps1`（自动重连隧道，优先 Wi-Fi 网卡）。
-- 规矩：只动 `/srv/operator/`；保留 `flide-patch`；模型只在服务器上调用；不给 OneJev 发图；内存只读；令牌不进文件。
+- 规矩：只修改项目目录 `/srv/pvz-harness/`；保留 `flide-patch`；模型只在服务器上调用；不给 OneJev 发图；内存只读；令牌不进文件。
 
 ## 6. 测试
 
@@ -228,7 +241,7 @@ Jev 默认每 2 游戏秒、Planner 每 20 游戏秒，事件可提前触发；w
 | 反馈信号 | 每步稠密奖励 + 价值函数 | 每局一个分数，靠 Coach 读日志归因 |
 | 数据规模 | 每天相当于数百年游戏时长 | 一轮 88 局，且至今一轮未跑完 |
 | 训练与实战环境 | 同一个游戏核心、同一份特征 | 研究冻结时钟+状态输入，实战实时+截图识图，文档自己承认不能直接迁移 |
-| 动作空间 | 完整操作，含选英雄 | 只有「种一株」或等待；不选卡（卡组写死在配置）、不用铲子、菜单人工点 |
+| 动作空间 | 完整操作，含选英雄 | 种一株、铲一格（System0 的 act/fallback，2026-11-03 起）或等待；选卡由 Qwen 做（训练自动、实战按“选植物”），菜单人工点 |
 | 课程 | 固定阵容 → 全阵容，蒸馏 | 关卡顺序闯关，首败即停；无蒸馏 |
 | 示范数据 | 早期用人类录像监督学习 | 有对局日志，但没有用来训练任何东西 |
 | 基础设施 | 自有集群 | 共享服务器 + 别人的模型池 + 单一 SSH 端口 |
@@ -258,7 +271,11 @@ Jev 默认每 2 游戏秒、Planner 每 20 游戏秒，事件可提前触发；w
 7. **决策模型不是为这个游戏训练的。** Jev 是通用模型在最多几十个文字选项里打分，1 s 超时，失败就等待；
    没有时序记忆（System0 的记忆是唯一补充），没有价值估计。绝悟的网络就是为这个任务训练的，带动作掩码和 LSTM。
 
-8. **动作空间不完整。** 不选卡（`PVZ_LOADOUT` 写死 6 张）、不用铲子、菜单和下一关要人工点、一次决策只种一株。
+8. **动作空间不完整。** 菜单和下一关要人工点、一次决策只种一株（可先铲同一格）。
+   选卡（2026-11-03）：有选卡界面的关卡（第 8、9 关起；植物不多于卡槽时游戏直接开局）由 Qwen 按预告的僵尸种类、可选植物和 playbook 策略笔记挑满空卡槽（`server/seed_choice.py`）。训练：Harness 的 `prepare` 停在选卡阶段，给出空卡槽数、可选植物和预告僵尸种类（关卡波次里出现的种类，不含旗帜僵尸，和选卡界面显示的一致），桥接用文字版问 Qwen，`choose` 用游戏自己的选卡逻辑放卡并开局；Qwen 失败时退回原来的固定顺序并记下错误；每局结果里有 `seed_choice`。实战：控制中心的“选植物”按钮，代码读选卡截图（空位、可选植物），Qwen 看图挑，客户端逐张点卡，“一起摇滚吧”由人点；记录在服务器 `data/seed_choices/`。选卡区有第 7 行的存档暂不支持。
+   实战从截图识别卡槽里是哪张卡（见下）。
+   铲子（2026-11-03）：System0 的 `act()`/`fallback()` 可返回 `{type: shovel, row, col}`，先铲后种；实战由代码在卡槽右侧找铲子框（`server/shovel.py`，模板 `knowledge/shovel_box.png`），点铲子再点格子；Portable 训练用 Harness 的 `dig` 命令走游戏自己的铲子逻辑；pvz_rl 没有铲子。没有内置铲子策略，什么时候铲由 Coach 写进 System0。植物受损程度看不到。
+   卡片识别（`server/seed_packets.py`）：每个卡槽的截图和游戏自身卡片图模板做颜色归一化相关匹配，模板来自 Portable 训练渲染、已知真实卡片的裁剪（`scripts/harvest_seed_packets.py` → `scripts/build_seed_templates.py` → `knowledge/seed_packets.npz`）。最佳匹配不够高或领先不够就记为 unknown，这张卡不可用；同一关内每个卡槽沿用上一次有把握的识别结果。模板目前覆盖豌豆射手、向日葵、樱桃炸弹、坚果、土豆雷、寒冰射手（训练关卡用到的卡）；大嘴花、双发射手等还没有样本，会被识别为 unknown。`PVZ_LOADOUT` 只留给研究环境的截图条件和测试使用。
    绝悟连选英雄都是学出来的。
 
 9. **评测门槛统计功效低、覆盖窄。** 确认阶段 12 对样本、单侧符号检验 p≤0.05：没有平局时至少 10 对要变好才通过，
@@ -284,6 +301,6 @@ Jev 默认每 2 游戏秒、Planner 每 20 游戏秒，事件可提前触发；w
 3. **稠密奖励和逐步归因。** 用研究环境的状态算每步奖励，Coach 读到的不只是一局总分。
 4. **减少模型调用。** 研究里事件触发为主、心跳拉长；实战把植物/僵尸识图换成代码分类器（6 ms），Qwen 只读难的部分。
 5. **让训练和实战用同一条感知链。** 研究的截图条件走和实战一样的代码识图，迁移才有依据。
-6. **补全动作**：选卡、铲子；先在研究环境里加，再接实战。
+6. **补全动作**：选卡（铲子已加，见第 8 条）；先在研究环境里加，再接实战。
 7. **调整门槛的统计设计**：增加确认样本，或用均值差的置信区间，而不是只看符号。
 8. **工程**：及时提交和推送；收敛到一条主路线，停掉的路线归档。

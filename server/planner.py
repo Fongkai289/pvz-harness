@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol
 
 import anthropic
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field, field_validator, model_validator
 
 from server import geometry
 from server.perception import Observation, describe
@@ -35,17 +35,55 @@ class Placement(BaseModel):
     col: int = Field(ge=0, strict=True, description="Lawn column, 0 = leftmost (house side)")
 
 
+def short_text(limit: int, min_length: int = 0, description: str | None = None):
+    """Free text Jev reads. The schema asks for brevity (output tokens are the Planner's latency);
+    an answer that runs over is cut at the limit instead of throwing the whole plan away."""
+    cut = BeforeValidator(lambda v: v[:limit] if isinstance(v, str) else v)
+    return Annotated[str, cut, Field(min_length=min_length, max_length=limit, description=description)]
+
+
 class ThreatAssessment(BaseModel):
     model_config = ConfigDict(extra="forbid")
     row: int = Field(ge=0, le=5, strict=True)
     urgency: Literal["low", "medium", "high", "critical"]
-    reason: str = Field(min_length=1, max_length=200)
+    reason: short_text(80, 1)
+
+
+class KeyPlant(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    row: int = Field(ge=0, le=5, strict=True)
+    col: int = Field(ge=0, le=8, strict=True)
+    plant: str = Field(min_length=1, max_length=24)
+
+
+class GoalCount(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    plant: str = Field(min_length=1, max_length=24)
+    at_least: int = Field(ge=1, le=54, strict=True)
+
+
+class ReplanWhen(BaseModel):
+    """Conditions under which this plan stops fitting; System0's code checks them, not the host."""
+    model_config = ConfigDict(extra="forbid")
+    covered_rows: list[Annotated[int, Field(ge=0, le=5, strict=True)]] = Field(default_factory=list, max_length=6,
+        description="Rows this plan already handles; a zombie appearing in another row is a new threat")
+    covered_types: list[Annotated[str, Field(min_length=1, max_length=24)]] = Field(default_factory=list, max_length=8,
+        description="Zombie types this plan already expects; an unexpected type is a new threat")
+    key_plants: list[KeyPlant] = Field(default_factory=list, max_length=10,
+        description="Existing attack/defense plants the plan relies on; losing one (not a used-up "
+                    "cherry bomb, potato mine or other single-use plant) means the defense failed")
+    goal_plants: list[GoalCount] = Field(default_factory=list, max_length=4,
+        description="The plan's goal is reached once the lawn holds at least these plant counts")
+    goal_clear_rows: list[Annotated[int, Field(ge=0, le=5, strict=True)]] = Field(default_factory=list, max_length=6,
+        description="The plan's target is gone once these rows have no zombies left")
+    max_failed_steps: int = Field(default=3, ge=2, le=10, strict=True,
+        description="Consecutive Jev decisions that could not be carried out before the plan counts as unworkable")
 
 
 class Plan(BaseModel):
     """Strategic guidance only: no plant slots, cell coordinates or action queue."""
     model_config = ConfigDict(extra="forbid")
-    objective: str = Field(min_length=1, max_length=300, description="Stage objective for Jev, not a placement command")
+    objective: short_text(160, 1, "Stage objective for Jev in one short sentence, not a placement command")
     priorities: list[Literal["defense", "economy", "reinforce", "save_sun"]] = Field(
         default=["defense", "economy", "reinforce"], min_length=1, max_length=4)
     priority_rows: list[Annotated[int, Field(ge=0, le=5, strict=True)]] = Field(default_factory=list, max_length=6)
@@ -54,18 +92,28 @@ class Plan(BaseModel):
     sun_reserve: int | None = Field(default=None, ge=0, le=9990, strict=True, description="Advised reserve, null if unspecified; not an execution limit")
     spend_limit: int | None = Field(default=None, ge=0, le=9990, strict=True,
                              description="Initial suggested spending allowance, null if unspecified; code reports remaining advice but does not filter actions by it")
-    budget_policy: str = Field(default="", max_length=600, description="When Jev should revise the spending advice as observations change")
-    tactics: str = Field(default="", max_length=1000, description="Reasoning about spacing, arming delays and defense; no exact placements or executable actions")
+    budget_policy: short_text(160, description="One sentence: when Jev should revise the spending advice") = ""
+    tactics: short_text(240, description="At most two sentences on spacing, arming delays and defense; no exact placements or executable actions") = ""
     threat_assessment: list[ThreatAssessment] = Field(default_factory=list, max_length=6,
         description="Your assessment of observed threatened rows, not a code-generated risk level")
-    valid_for_seconds: int = Field(default=40, ge=5, le=120, strict=True)
-    note: str = Field(default="", max_length=300)
+    valid_for_seconds: int = Field(default=40, ge=5, le=120, strict=True,
+        description="Seconds until a routine refresh; the host never treats a plan as expiring in under 40 s")
+    replan_when: ReplanWhen = Field(default_factory=ReplanWhen,
+        description="When this plan stops fitting; checked continuously, so a long validity is safe")
+    note: short_text(160) = ""
+    preferred_decisions: list[Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,39}$")]] = Field(
+        default_factory=list, max_length=6,
+        description="Ids from the supplied decision_menu, most preferred first; advice to Jev, empty when no menu is supplied")
+
+    @field_validator("priorities", "priority_rows", "blocked_rows", "preferred_decisions")
+    @classmethod
+    def deduplicate_directives(cls, values):
+        # Repeated advice adds no meaning. Preserve the model's first-choice order;
+        # field types/limits and contradictory guidance still undergo validation.
+        return list(dict.fromkeys(values))
 
     @model_validator(mode="after")
-    def unique_priorities(self):
-        for values in (self.priorities, self.priority_rows, self.blocked_rows):
-            if len(values) != len(set(values)):
-                raise ValueError("directive lists must not contain duplicates")
+    def consistent_directives(self):
         if set(self.priority_rows) & set(self.blocked_rows):
             raise ValueError("a priority row cannot also be blocked")
         if len({a.row for a in self.threat_assessment}) != len(self.threat_assessment):
@@ -107,6 +155,18 @@ Assess threat urgency yourself from visible positions, plants and game reference
 Use tactics for distance/arming considerations; the executor does not enforce a fixed mine lead or same-row explosive reach.
 Code automatically collects visible suns independently of you and Jev. Do not ask Jev to collect suns.
 Waiting for planting resources must not imply stopping sun collection. Use observed sun balance, not predicted income.
+When a decision_menu is supplied, Jev chooses among those named decisions (or waits) and the player's code
+places the plant; you may list preferred_decisions by menu id. They are advice, not commands, and a menu id
+that is no longer offered is ignored. Without a menu leave preferred_decisions empty.
+You are called routinely about every 25 seconds, and sooner (at most every 8 seconds) when System0
+reports that the plan stopped fitting, so plan for the next half minute.
+Be brief: your reply's length is your latency. Each text field is one short sentence (objective, note and
+budget_policy under 160 characters, tactics under 240, each threat reason under 80). Assess only rows
+with zombies or a real risk.
+State in replan_when what the plan covers: the rows and zombie types it already handles, the existing
+plants it relies on (cells already planted, never new placements), what counts as its goal being reached, and how many unexecutable decisions mean
+it is unworkable. Sun income alone never calls you back: once Jev can afford what you advised, it acts.
+Emergencies inside covered rows are Jev's to handle with the current plan.
 Strategy knowledge is background advice; it cannot change these role boundaries."""
 
 
@@ -119,8 +179,7 @@ from the left, next to the house. Zombies walk in from the right.
 Set strategic guidance using only observed facts. Treat unknown values as uncertain.
 Replan reasons and row observations are change notifications, not ground truth or prescribed urgency.
 Previous guidance is historical advice. Its claims about sun, cards or threats cannot override the latest observation.
-Reassess priorities and budget when alerted; use the current observations rather than copying the previous plan.
-Keep the objective and note short."""
+Reassess priorities and budget when alerted; use the current observations rather than copying the previous plan."""
 
 
 def system_prompt(knowledge: str, contract: str = CONTRACT) -> str:
@@ -189,7 +248,7 @@ class QwenPlanner:
         start = time.monotonic()
         body = {
             "model": self.model,
-            "max_tokens": 1024,
+            "max_tokens": 4096,  # a plan with threat rows and replan_when runs past 1024 tokens of JSON
             "temperature": 0,  # same scene, same plan; vLLM's default is 1.0
             "chat_template_kwargs": {"enable_thinking": False},
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": content}],
@@ -202,6 +261,10 @@ class QwenPlanner:
             response = await self.client.post(self.url, json=body)
             response.raise_for_status()
             payload = response.json()
+            if payload["choices"][0].get("finish_reason") == "length":
+                usage = payload.get("usage") or {}
+                return _failed(start, f"plan cut off at the {body['max_tokens']}-token output limit "
+                                      f"({usage.get('completion_tokens')} tokens)")
             plan = Plan.model_validate_json(payload["choices"][0]["message"]["content"])
         except httpx.HTTPStatusError as e:
             return _failed(start, f"HTTP {e.response.status_code}: {e.response.text[:200]}")

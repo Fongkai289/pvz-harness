@@ -48,6 +48,8 @@ def check(p: Placement, scene: Scene, planted: dict[tuple[int, int], list[str]],
     if p.slot < 0 or p.slot >= len(scene.cards) or scene.cards[p.slot].slot != p.slot:
         return f"no seed slot {p.slot}"
     card = scene.cards[p.slot]
+    if card.plant == "unknown":
+        return f"seed slot {p.slot} was not recognized on screen"
     occupants = planted.get((p.row, p.col), [])
     if not cell_free_for(card.plant, occupants):
         return f"cell ({p.row}, {p.col}) already has {', '.join(occupants)}"
@@ -58,4 +60,22 @@ def check(p: Placement, scene: Scene, planted: dict[tuple[int, int], list[str]],
     cost = card_cost(card)
     if scene.sun is not None and cost is not None and scene.sun - sun_spent < cost:
         return f"{card.plant} costs {cost}, sun left is {scene.sun - sun_spent}"
+    return None
+
+
+def check_shovel(row: int, col: int, scene: Scene, planted: dict[tuple[int, int], list[str]]) -> str | None:
+    """None if digging up the plant in this cell is allowed, else the reason it is not.
+
+    The game's shovel removes the top plant of the cell and refunds nothing; it cannot dig graves.
+    """
+    rows = scene.rows or 5
+    if not (0 <= row < rows and 0 <= col < COLS):
+        return f"cell ({row}, {col}) is outside a {rows}-row lawn"
+    if scene.shovel is not True:
+        return "no shovel in its box"
+    occupants = planted.get((row, col), [])
+    if not occupants:
+        return f"cell ({row}, {col}) has no plant to dig up"
+    if "grave buster" in occupants:
+        return "the shovel cannot dig up a grave buster"
     return None

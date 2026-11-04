@@ -7,6 +7,7 @@ optionally read_state() for the judge. See mock_client.py and windows_client.py.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import math
@@ -61,6 +62,7 @@ class ServerLink:
         self.bytes_sent = 0
         self.bytes_received = 0
         self.rtt_ms: float | None = None
+        self.frame_times: collections.deque[float] = collections.deque(maxlen=200)
         self.model_timings: dict[str, dict] = {}
         self.model_activity = ModelActivity()
         self.telemetry_supported = False
@@ -93,7 +95,8 @@ class ServerLink:
 
     async def run(self, duration: float | None = None, done: Callable[[], bool] | None = None) -> None:
         """Play until `duration` seconds pass or `done()` (e.g. the game was won or lost) is true."""
-        async with websockets.connect(self.url, max_size=None) as ws:
+        # The tunnel can stall for seconds on a weak network; 10 s (the default) gave up on handshakes that arrived.
+        async with websockets.connect(self.url, max_size=None, open_timeout=30) as ws:
             await self._send(ws, dumps(Hello(token=self.token, client_id=self.client_id,
                                       game_version=self.game_version, playbook=self.playbook, telemetry=True)))
             raw = await ws.recv()
@@ -135,17 +138,34 @@ class ServerLink:
                     "outcome": self.game_outcome})))
 
     async def _send_frames(self, ws) -> None:
+        """At most one frame in flight: the next screenshot is taken only after the server has the previous one.
+
+        The SSH tunnel buffers megabytes, so a link slower than fps x frame size otherwise queues stale frames
+        for many seconds and every click (suns above all) lands where things used to be. A ping sent after a
+        frame is answered only once the server has received that frame, so its pong is the acknowledgement.
+        """
         interval = 1.0 / self.fps
+        delivered = None
         while True:
             if self.check_terminal():
                 return
+            if delivered is not None:
+                await delivered
             start = time.monotonic()
             self.frame_id += 1
             t_capture = time.time()
             jpeg, w, h = await asyncio.to_thread(self.grab)
             header = FrameHeader(frame_id=self.frame_id, t_capture=t_capture, width=w, height=h)
             await self._send(ws, pack_frame(header, jpeg))
+            delivered = await ws.ping()
+            self.frame_times.append(time.monotonic())
             await asyncio.sleep(max(0.0, interval - (time.monotonic() - start)))
+
+    def upload_fps(self, window_s: float = 5.0) -> float:
+        """Frames the server actually took per second recently; below fps when the network is the limit."""
+        now = time.monotonic()
+        recent = [t for t in self.frame_times if now - t <= window_s]
+        return len(recent) / window_s
 
     async def _send_state(self, ws) -> None:
         while True:

@@ -144,6 +144,12 @@ class NativeArena:
         _, _, terminal, truncated, info = self.env.step(action)
         return terminal, truncated, info
 
+    def shovel(self, cell):
+        raise RuntimeError("the pvz_rl executor has no shovel action")
+
+    def prepare(self, level, seed):
+        return None, self.reset(level, seed)  # pvz_rl has no seed chooser: its fixed loadout, already playing
+
     def pixels(self):
         """Capture ONLY the owned private game client area; never arbitrary desktop pixels."""
         import ctypes

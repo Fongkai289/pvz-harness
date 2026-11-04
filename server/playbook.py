@@ -65,7 +65,12 @@ class PlaybookStore:
         return sorted(p.stem for p in self.dir.glob("v*.json"))
 
     def next_version(self) -> str:
-        return f"v{int(self.versions()[-1][1:]) + 1:03d}"
+        """Past the highest version here and in the paired store (live data_dir <-> data_dir/portable_study):
+        promotions are copied between them, so one version name must never mean two different playbooks."""
+        root = self.dir.parent
+        peer = root.parent if root.name == "portable_study" else root / "portable_study"
+        versions = self.versions() + sorted(p.stem for p in (peer / "playbooks").glob("v*.json"))
+        return f"v{max(int(v[1:]) for v in versions) + 1:03d}"
 
     def write(self, playbook: Playbook) -> None:
         path = self.dir / f"{playbook.version}.json"

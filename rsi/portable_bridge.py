@@ -9,7 +9,7 @@ import time
 
 from common.file_lock import file_lock
 from rsi.code_store import write_json
-from rsi.native_bridge import Bridge, serve
+from rsi.native_bridge import IDLE_EXIT_S, Bridge, serve
 from rsi.native_engineer import NativeEngineer
 from rsi.native_jobs import NativeJobs, digest, TERMINAL
 from rsi.native_gate import episode_score
@@ -42,7 +42,7 @@ def isolated_settings(settings):
                 if NativeCodeStore(root).add(source)!=original.player_code: raise ValueError('code seed mismatch')
             store.set_current(original.version)
             write_json(root/'origin.json',dict(version=original.version,digest=digest(original.model_dump()),
-                time=time.time(),scope='Portable research only; live CURRENT unchanged'))
+                time=time.time(),scope='Portable training; promotions are mirrored to live by rsi.book_sync'))
     return replace(settings,data_dir=root)
 
 
@@ -50,6 +50,39 @@ class PortableBridge(Bridge):
     def __init__(self,settings):
         super().__init__(isolated_settings(settings))
         self.jobs=PortableJobs(self.settings)
+
+    def close_stale(self,keep_prefix):
+        """A new training run closes what earlier runs left open (a dead run never resumes its jobs)."""
+        if not isinstance(keep_prefix,str) or not keep_prefix: raise ValueError('keep_prefix required')
+        closed=[]
+        for path in sorted(self.jobs.root.glob('*/job.json')):
+            job=self.jobs.load(path.parent.name)
+            if job['status'] in TERMINAL or job['id'].startswith(keep_prefix): continue
+            if job.get('kind')=='campaign' and job['status']=='campaign_complete': continue  # a finished game record
+            if job.get('kind')=='level' and job.get('group'): continue  # the next run finishes it (resumable_round)
+            job.update(status='stopped',reason=f'left unfinished by an earlier run; closed when {keep_prefix} started')
+            self.jobs.save(job)
+            closed.append(job['id'])
+        return {'closed':closed}
+
+    def level_start(self,level):
+        """Give a level its own playbook entry before training it, copied from the previous level's."""
+        from rsi.book_sync import mirror_level, peer_root
+        from server.level_books import LevelBooks
+        if type(level) is not int or not 1<=level<=10: raise ValueError('level must be 1..10')
+        books,store=LevelBooks(self.settings.data_dir),self.jobs.store
+        existing=books.get(level)
+        source=None
+        if existing is None:
+            source=inherited_level(books,level)
+            version=books.get(source) if source else store.current()
+            parent=store.current()
+            books.set(store,level,version,expected=parent)
+            store.log(kind='level_book',level=level,version=version,inherited_from=source,parent=parent)
+            skipped=mirror_level(self.settings.data_dir,peer_root(self.settings.data_dir),level,version,parent)
+        else:
+            version,skipped=existing,None
+        return dict(level=level,version=version,inherited_from=source,mirror_skipped=skipped)
 
     async def handle(self,request):
         op=request['op']
@@ -59,7 +92,10 @@ class PortableBridge(Bridge):
                         scope='research CURRENT',engine_digest=self.jobs.engine_digest())
         if op=='portable_create':
             name=request['name']
-            job=self.jobs.enqueue(name)
+            # level_book: a campaign game played with that level's own playbook (per-level training).
+            book_level=request['level'] if request.get('level_book') and request.get('level') is not None else None
+            job=self.jobs.enqueue(name,target=request.get('target') if request.get('level') is None else None,
+                                  book_level=book_level)
             if request.get('level') is not None:
                 level=request['level']; seed=request['seed']
                 if type(level) is not int or not 1<=level<=10 or type(seed) is not int or not 0<=seed<2**30:
@@ -90,6 +126,30 @@ class PortableBridge(Bridge):
             job.update(status='campaign_complete',outcome=ep['outcome'],score=score)
             self.jobs.save(job)
             return job
+        if op=='portable_close_stale':
+            return self.close_stale(request['keep_prefix'])
+        if op=='portable_level_start':
+            return self.level_start(request['level'])
+        if op=='portable_level_attempt':
+            evidence=self.jobs.load(request['evidence_job'])
+            if evidence.get('kind')=='campaign':
+                report=json.loads((self.jobs.folder(evidence['id'])/'campaign.json').read_text(encoding='utf-8'))
+            elif evidence.get('kind')=='level':
+                folder=self.jobs.folder(evidence['id'])
+                tests=sorted((folder/'engineer').glob('test*-report.json'),key=lambda p:int(p.name.split('-')[0][4:]))
+                # A kept candidate's last test is the newest game of the level's playbook; otherwise the old evidence is.
+                report=json.loads((tests[-1] if evidence.get('promoted') and tests else folder/'evidence.json').read_text(encoding='utf-8'))
+            else:
+                raise ValueError('evidence must be a campaign game or a level attempt')
+            level=request['level']
+            if report['episodes'][0]['level']!=level: raise ValueError('evidence is from another level')
+            return self.jobs.level_attempt(request['name'],level,report,group=request.get('group'),angle=request.get('angle'),
+                                           evidence_job=evidence['id'])
+        if op=='portable_level_resume':
+            return self.jobs.resumable_round(request['level'])
+        if op=='portable_level_keep':
+            best,jobs=self.jobs.keep_best(request['jobs'])
+            return {'best':best,'jobs':[{k:v for k,v in j.items() if k not in ('suites','engineering')} for j in jobs]}
         if op=='prepare':
             job=self.jobs.load(request['job_id'])
             if job['status'] in TERMINAL: return job
@@ -109,12 +169,21 @@ class PortableBridge(Bridge):
             raise
 
 
+CONVEYOR=(5,10)
+
+
+def inherited_level(books, level):
+    """The latest earlier ordinary level with its own playbook: a new level starts from it."""
+    return next((l for l in range(level-1,0,-1) if l not in CONVEYOR and books.get(l)),None)
+
+
 async def main():
     settings=load_settings()
     if settings.planner!='qwen' or settings.decider!='onejev': raise ValueError('production roles required')
     bridge=PortableBridge(settings)
     try:
-        with file_lock(bridge.jobs.root/'WORKER.lock',blocking=False): await serve(bridge)
+        # A previous bridge whose SSH link died exits within IDLE_EXIT_S; wait for it rather than fail.
+        with file_lock(bridge.jobs.root/'WORKER.lock',timeout=IDLE_EXIT_S+60): await serve(bridge)
     finally: await bridge.close()
 
 

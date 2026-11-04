@@ -128,7 +128,7 @@ def test_stop_arriving_with_inference_result_blocks_every_game_step(tmp_path):
     assert arena.actions == []
 
 
-def test_threat_pending_during_planner_cooldown_survives_until_replan(tmp_path):
+def test_lost_plant_wakes_jev_but_sends_no_replan_event(tmp_path):
     class ThreatArena(Arena):
         def info(self):
             info = super().info()
@@ -148,12 +148,12 @@ def test_threat_pending_during_planner_cooldown_survives_until_replan(tmp_path):
                 {'level':2,'seed':17}, rpc, tmp_path)
     calls = {p['tick']:p for p in rpc.calls}
     assert [50,250,450,650] == list(calls)[1:]
-    for tick in (50,250,450):
-        assert calls[tick]['pending_replan_events'] == ['plant_lost']
-    assert calls[650]['pending_replan_events'] == []
+    # Whether the loss needs a new plan is System0's call in the bridge, not the executor's.
+    assert not any('pending_replan_events' in p for p in rpc.calls)
+    assert calls[50]['decision_reasons'] == ['plant_lost']
 
 
-def test_bridge_honors_pending_event_after_cooldown(settings, monkeypatch):
+def test_bridge_events_alone_only_refresh_on_schedule(settings, monkeypatch):
     async def run():
         bridge = Bridge(settings)
         try:
@@ -168,11 +168,13 @@ def test_bridge_honors_pending_event_after_cooldown(settings, monkeypatch):
             monkeypatch.setattr(bridge.selector,'select',select)
             request = dict(request_digest=digest(task),episode_id='cooldown',
                            plan=Plan(objective='old guidance',valid_for_seconds=60).model_dump(),
-                           plan_tick=0,spent=0,pending_replan_events=['plant_lost'],**public())
-            early = await bridge.decide(job,dict(request,tick=50))
-            assert early['plan_tick']==0 and not calls
-            ready = await bridge.decide(job,dict(request,tick=400))
-            assert ready['plan_tick']==400 and len(calls)==1
+                           plan_tick=0,spent=0,decision_reasons=['plant_lost'],**public())
+            early = await bridge.decide(job,dict(request,tick=400))
+            assert early['plan_tick']==0 and early['replan'] is None and not calls
+            not_yet = await bridge.decide(job,dict(request,tick=2000))  # 20 s cycle, but routine refresh waits 25 s
+            assert not_yet['plan_tick']==0 and not calls
+            ready = await bridge.decide(job,dict(request,tick=2500))
+            assert ready['plan_tick']==2500 and ready['replan']['trigger']=='periodic' and len(calls)==1
         finally:
             await bridge.close()
     asyncio.run(run())

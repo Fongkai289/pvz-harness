@@ -16,11 +16,15 @@ from pydantic import BaseModel, Field, ValidationError
 
 from rules.playbook_rules import (
     EDITABLE_SECTIONS,
+    DecisionParams,
     FastParams,
     JevPolicy,
     PerceptionParams,
     PlannerKnowledge,
     Playbook,
+    ReflexParams,
+    FallbackParams,
+    LessonBook,
     TimingParams,
 )
 from server import perception
@@ -42,6 +46,10 @@ class Proposal(BaseModel):
     jev: JevPolicy | None = None
     planner: PlannerKnowledge | None = None
     timing: TimingParams | None = None
+    decision: DecisionParams | None = None
+    reflex: ReflexParams | None = None
+    fallback: FallbackParams | None = None
+    lessons: LessonBook | None = None
     rationale: str = Field(description="Which failure this targets and why the change should fix it")
 
     def apply(self, current: Playbook, version: str) -> Playbook:
@@ -195,11 +203,20 @@ async def propose(current: Playbook, dev: dict[str, Any], ledger: list[dict[str,
                             "json_schema": {"name": "proposal", "schema": schema}},
     }
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post(s.qwen_url, json=body)
-            response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        proposal = Proposal.model_validate_json(content)
+        if s.coach_provider == 'codex':
+            from rsi.code_model import request_role
+            from rsi.native_jobs import digest
+            controls = s.data_dir / 'strategy_coach' / digest(user)
+            proposal, _ = await request_role('coach',body['messages'],Proposal,s,
+                                             controls=controls,audit_dir=controls/'calls')
+        elif s.coach_provider == 'qwen':
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(s.qwen_url, json=body)
+                response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            proposal = Proposal.model_validate_json(content)
+        else:
+            raise ValueError('unsupported coach provider')
         if strategy_only and any(getattr(proposal, name) is not None for name in EDITABLE_SECTIONS if name != "planner"):
             return None, "candidate changes unevaluated sections"
         if s.decider == "onejev" and proposal.jev is not None:

@@ -9,7 +9,11 @@ edits all of them. Sections added later carry defaults, so older versions still 
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from rules.lessons import parse_condition, vocabulary
 
 
 class PerceptionParams(BaseModel):
@@ -162,6 +166,73 @@ class TimingParams(BaseModel):
     danger_min_seconds: float = Field(default=4, ge=2, le=12, strict=True)
 
 
+class DecisionParams(BaseModel):
+    """Read by the Jev step: how Jev's alternatives are presented.
+
+    auto: the named decision menu when player_code defines options() and act(), otherwise
+    the built-in hierarchical (live) or scheduled (research) placement choice.
+    hierarchical/flat force the built-in placement choice even when a menu exists (A/B).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    jev_mode: Literal["auto", "hierarchical", "flat"] = "auto"
+
+
+class ReflexParams(BaseModel):
+    """Read by the action gate for player_code reflex() actions (every 0.25 s).
+
+    Sun pickup reflexes are always permitted; planting from a reflex is off unless enabled,
+    and every reflex plant still passes the hard rules.
+    """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    allow_planting: bool = False
+    min_plant_interval_s: float = Field(default=4, ge=2, le=60, strict=True)
+
+
+class FallbackParams(BaseModel):
+    """Read when System0's decide() has said the current plan no longer fits (request_replan).
+
+    Until the next plan arrives, player_code fallback() replaces Jev and may plant directly;
+    off unless enabled, and every plant still passes the hard rules.
+    """
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    allow_planting: bool = False
+    min_plant_interval_s: float = Field(default=2, ge=1, le=30, strict=True)
+
+
+class Lesson(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: str = Field(pattern=r"^[a-z][a-z0-9_]{0,39}$")
+    when: str = Field(description="One expression with and/or/not, comparisons and + - * /; unknown values make "
+                                  "a comparison false. Names: " + vocabulary())
+    then: str = Field(min_length=1, max_length=300, description="One short piece of advice for Planner and Jev")
+
+    @model_validator(mode="after")
+    def check_condition(self):
+        parse_condition(self.when)
+        return self
+
+
+class LessonBook(BaseModel):
+    """Read by Planner and Jev: each lesson is shown only while its condition holds on the current lawn.
+
+    Conditions use a fixed vocabulary of observed facts; at most max_shown matching lessons, in
+    listed order, go into a call. planner.knowledge stays for advice that always applies.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    items: list[Lesson] = Field(default_factory=list, max_length=30)
+    max_shown: int = Field(default=4, ge=1, le=8, strict=True)
+
+    @model_validator(mode="after")
+    def unique_ids(self):
+        if len({lesson.id for lesson in self.items}) != len(self.items):
+            raise ValueError("lesson ids must be unique")
+        return self
+
+
 class Playbook(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -172,9 +243,13 @@ class Playbook(BaseModel):
     jev: JevPolicy = Field(default_factory=JevPolicy)
     planner: PlannerKnowledge = Field(default_factory=PlannerKnowledge)
     timing: TimingParams = Field(default_factory=TimingParams)
+    decision: DecisionParams = Field(default_factory=DecisionParams)
+    reflex: ReflexParams = Field(default_factory=ReflexParams)
+    fallback: FallbackParams = Field(default_factory=FallbackParams)
+    lessons: LessonBook = Field(default_factory=LessonBook)
     notes: str = Field(default="", max_length=2000)
     player_code: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$",
-                                    description="Immutable evaluated System0 code; only Engineer's gated promotion can set it")
+                                    description="Immutable evaluated System0 code; only the coach's gated promotion can set it")
 
     @model_validator(mode="before")
     @classmethod
@@ -188,4 +263,4 @@ class Playbook(BaseModel):
         return self.model_dump(exclude={"jev"} if selector == "onejev" else set())
 
 
-EDITABLE_SECTIONS = ("perception", "fast", "jev", "planner", "timing")
+EDITABLE_SECTIONS = ("perception", "fast", "jev", "planner", "timing", "decision", "reflex", "fallback", "lessons")

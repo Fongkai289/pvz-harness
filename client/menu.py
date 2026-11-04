@@ -53,6 +53,15 @@ def is_game_over(frame: np.ndarray) -> bool:
     return _matches(frame, "game_over.jpg", ((280, 270, 520, 330),))
 
 
+def is_seed_chooser(frame: np.ndarray) -> bool:
+    """The seed selection screen: its "Choose your plants" title band is brown panel (live 2026-11-03:
+    hue 11, saturation 206), where a lawn frame shows grass (hue ~60)."""
+    if frame.shape[:2] != (600, 800):
+        return False
+    hsv = cv2.cvtColor(np.ascontiguousarray(frame[88:118, 10:450]), cv2.COLOR_BGR2HSV)
+    return 5 <= hsv[..., 0].mean() <= 18 and hsv[..., 1].mean() > 160 and hsv[..., 2].mean() > 110
+
+
 def is_playing(frame: np.ndarray) -> bool:
     if not _matches(frame, "day_1-6_start.png", ((10, 2, 86, 56),)):
         return False

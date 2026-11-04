@@ -46,6 +46,16 @@ def test_confirmation_needs_distinct_recent_frames_matching_position_and_area():
     assert not c.confirmed
 
 
+def test_a_landed_sun_confirms_at_one_frame_per_second_but_a_falling_one_waits():
+    c = SunCollector()
+    c.observe(seen(1, 300), 10.0)
+    c.observe(seen(2, 300), 11.4)  # slow link: frames 1.4 s apart, the sun has not moved
+    assert c.confirmed
+    c.observe(Observation(3, 0, [Blob(300, 200, 2000, 25)]), 12.4)
+    c.observe(Observation(4, 0, [Blob(300, 267, 2000, 25)]), 13.4)  # falling 67 px/s
+    assert not c.confirmed
+
+
 @pytest.mark.parametrize("x,y", [(50, 30), (490, 40), (740, 25), (500, 585), (795, 300), (-1, 350)])
 def test_collector_excludes_cards_shovel_menu_and_progress_ui(x, y):
     c = SunCollector()

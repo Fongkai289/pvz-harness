@@ -46,7 +46,7 @@ def player_state(raw, mask, tick):
     scene=Scene(frame_id=tick,t_capture=tick/100,lawn='day',rows=5,sun=g['sun'],
         cards=[Card(slot=c['slot'],plant=NAMES[c['plant_type']],ready=c['ready'],brightness=0,
                     cost=c['cost']) for c in cards], zombies=zombies,nearest_col=nearest,
-        positions='portable_training_state')
+        positions='portable_training_state',shovel=g.get('shovel'))
     return dict(scene=scene.model_dump(),plants=[dict(row=r,col=c,plants=p) for (r,c),p in plants.items()],
         allowed_positions=[[s,r,c] for s in range(len(cards)) for r in range(5) for c in range(9)
                            if mask[1+s*54+r*9+c]])
@@ -77,7 +77,7 @@ class PortableArena:
         events={row:t for row,t in enumerate(state['mower_ticks']) if t>=0 and row not in self.seen_mowers}
         self.seen_mowers.update(events)
         return dict(raw_observation=dict(backend='pvz_portable',global_state=dict(scene=0,grid_rows=5,
-                sun=state['sun'],current_wave=state['wave'],total_waves=state['waves']),
+                sun=state['sun'],current_wave=state['wave'],total_waves=state['waves'],shovel=state.get('shovel')),
                 plants=state['plants'],zombies=state['zombies'],
                 cards=[dict(slot=c['slot'],plant_type=c['type'],ready=c['ready'],cost=c['cost']) for c in state['cards']]),
             game_clock=state['tick'],rng_seed_support=2,rng_seed_applied=True,level_id=self.level,playthrough=1,
@@ -86,7 +86,7 @@ class PortableArena:
             events=dict(mower_triggered_rows=list(events),mowers_used=len(events),mower_trigger_ticks=events),
             result={'win':'WON','lose':'LOST','running':'NONE'}[state['outcome']])
 
-    def reset(self,level,seed):
+    def _fresh(self,level):
         # Cache/profile state in a reused engine can perturb later episodes.
         # A fresh owned process+save per episode costs startup time, but pairs fairly.
         if self.has_reset:
@@ -94,12 +94,35 @@ class PortableArena:
             self._start()
         self.has_reset=True
         self.level=level; self.seen_mowers=set()
+
+    def reset(self,level,seed):
+        self._fresh(level)
         return self._info(self.engine.call(f'reset {level} {seed}'))
+
+    def prepare(self,level,seed):
+        """reset() that stops at the seed chooser: (offer, None) there, else (None, info) already playing.
+
+        The offer is what the chooser screen shows: free slots, unlocked plants, previewed zombie types."""
+        from server.seed_choice import SEED_TYPES
+        self._fresh(level)
+        state=self.engine.call(f'prepare {level} {seed}')
+        if not state.get('chooser'):
+            return None,self._info(state)
+        return dict(level=level,slots=state['slots'],available=[SEED_TYPES[t] for t in state['available']],
+                    preview=[ZOMBIES[z] for z in state['preview']]),None
+
+    def choose(self,plants):
+        from server.seed_choice import SEED_TYPES
+        return self._info(self.engine.call('choose '+' '.join(str(SEED_TYPES.index(p)) for p in plants)))
 
     def step(self,placement):
         args='-1 0 0' if placement is None else '{slot} {row} {col}'.format(**placement)
         state=self.engine.call('step 25 '+args)
         return state['terminal'],state['tick']>=60000 and not state['terminal'],self._info(state,placement)
+
+    def shovel(self,cell):
+        """Dig up the plant in this cell with the game's own shovel; no ticks pass."""
+        self.engine.call('dig {row} {col}'.format(**cell))
 
     def pixels(self):
         import cv2

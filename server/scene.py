@@ -27,6 +27,7 @@ import numpy as np
 from pydantic import BaseModel, Field, ValidationError
 
 from server import geometry
+from server.shovel import find_shovel
 
 log = logging.getLogger(__name__)
 
@@ -115,6 +116,7 @@ class Scene(BaseModel):
     nearest_col: dict[int, int] = {}  # row -> column of its zombie closest to the house
     positions: str = "model"  # who placed the zombies: "model" (rows as the model said) or "code"
     other: str = ""
+    shovel: bool | None = None  # the shovel is in its box and can dig; None = not checked
 
     def describe(self) -> str:
         """Compact text for the decision step and for OneJev."""
@@ -138,12 +140,15 @@ class Scene(BaseModel):
 
 
 def read_cards(image: np.ndarray, loadout: list[str]) -> list[Card]:
+    """loadout: the plant in each slot, from server/seed_packets.py live or the public card choice in research.
+    An "unknown" slot (card art not recognized) is never usable."""
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     cards = []
     for slot, plant in enumerate(loadout):
         x0, _, x1, _ = geometry.seed_card_rect(slot)
         v = float(hsv[geometry.SEED_PICTURE_Y0:geometry.SEED_PICTURE_Y1, x0 + 4:x1 - 4, 2].mean())
-        cards.append(Card(slot=slot, plant=plant, ready=v >= CARD_READY_MIN_V, brightness=round(v, 1)))
+        cards.append(Card(slot=slot, plant=plant, ready=v >= CARD_READY_MIN_V and plant != "unknown",
+                          brightness=round(v, 1)))
     return cards
 
 
@@ -421,7 +426,8 @@ class QwenLooker:
                 if set(data) != {"sun"} or (sun is not None and (type(sun) is not int or not 0 <= sun <= 9990)):
                     raise ValueError("invalid sun count")
                 scene = Scene(frame_id=frame_id, t_capture=t_capture, lawn=lawn, rows=n_rows, sun=sun,
-                              cards=read_cards(image, loadout), zombies=[], nearest_col={})
+                              cards=read_cards(image, loadout), zombies=[], nearest_col={},
+                              shovel=find_shovel(image) is not None)
             usage = payload.get("usage") or {}
             return LookResult(scene, time.monotonic() - started, None, usage.get("prompt_tokens", 0),
                               usage.get("completion_tokens", 0))
@@ -511,7 +517,7 @@ class QwenLooker:
             positions = "model"
         scene = Scene(frame_id=frame_id, t_capture=t_capture, lawn=lawn, rows=n_rows, sun=report.sun,
                       cards=read_cards(image, loadout), zombies=zombies, nearest_col=nearest,
-                      positions=positions, other=report.other)
+                      positions=positions, other=report.other, shovel=find_shovel(image) is not None)
         usage = payload.get("usage") or {}
         return LookResult(scene, time.monotonic() - start, None, usage.get("prompt_tokens", 0),
                           usage.get("completion_tokens", 0))

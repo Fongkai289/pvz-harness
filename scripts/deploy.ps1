@@ -20,8 +20,8 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Key = (Resolve-Path $Key).Path
 $ssh = @("-n", "-i", $Key, "-p", $Port, "-o", "BatchMode=yes", "-o", "LogLevel=ERROR")
 $scp = @("-q", "-i", $Key, "-P", $Port, "-o", "BatchMode=yes", "-o", "LogLevel=ERROR")
-$remoteTar = "/srv/operator/.pvz-deploy.tgz"
-$remoteScript = "/srv/operator/.pvz-deploy.sh"
+$remoteTar = "$RemoteDir/data/.pvz-deploy.tgz"
+$remoteScript = "$RemoteDir/data/.pvz-deploy.sh"
 
 function Invoke-Native([string]$exe, [string[]]$argv) {
     & $exe @argv

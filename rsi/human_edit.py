@@ -58,14 +58,26 @@ def main() -> None:
                         help="change one field, e.g. jev.economy_first=5; repeatable")
     parser.add_argument("--note", required=True)
     parser.add_argument("--no-promote", action="store_true", help="write the version but keep CURRENT")
+    parser.add_argument("--player-code", choices=["seed"],
+                        help="attach the built-in seed System0 code (otherwise only a gated promotion sets player_code)")
+    parser.add_argument("--both", action="store_true",
+                        help="also make the new version CURRENT for Portable training (data_dir/portable_study)")
     args = parser.parse_args()
-    if args.planner_knowledge is None and not args.set:
-        parser.error("nothing to change: give --planner-knowledge and/or --set")
+    if args.planner_knowledge is None and not args.set and not args.player_code:
+        parser.error("nothing to change: give --planner-knowledge, --set and/or --player-code")
+    if args.both and args.no_promote:
+        parser.error("--both copies the new CURRENT; it cannot be combined with --no-promote")
 
-    store = PlaybookStore(load_settings().data_dir)
+    data_dir = load_settings().data_dir
+    store = PlaybookStore(data_dir)
     current = store.load()
     knowledge = planner_block(args.planner_knowledge) if args.planner_knowledge else None
     new, changes = edit(current, store.next_version(), args.note, knowledge, args.set)
+    if args.player_code:
+        from rsi.native_player import SEED, NativeCodeStore
+        code = NativeCodeStore(data_dir).add(SEED)
+        changes["player_code"] = [current.player_code, code]
+        new = new.model_copy(update={"player_code": code})
     store.write(new)
     if not args.no_promote:
         store.set_current(new.version)
@@ -73,6 +85,12 @@ def main() -> None:
               changes=changes, source=str(args.planner_knowledge) if args.planner_knowledge else "--set",
               note=args.note)
     print(f"{current.version} -> {new.version}: {json.dumps(changes)}; CURRENT = {store.current()}")
+    if args.both:
+        from rsi.book_sync import mirror, peer_root
+        skipped = mirror(data_dir, peer_root(data_dir), new.version, current.version)
+        print("Portable training CURRENT = " + (new.version if skipped is None else "unchanged: " + skipped))
+        if skipped:
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

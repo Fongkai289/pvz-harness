@@ -54,6 +54,13 @@ class Settings:
     zombies_interval: float = 4.0
     auto_native_rsi: bool = False
     native_evolution: str = "strategy"
+    native_coach_actions: int = 20  # tool actions per research round for the single coach role
+    native_coach_tests: int = 2  # development test runs per round
+    coach_provider: str = "qwen"
+    coach_model: str = "gpt-6-astra"
+    coach_queue_dir: Path = ROOT / "data/codex_coach"
+    coach_timeout: float = 240
+    system0_actions: bool = True  # live master switch: off stops every System0 plant (reflex and fallback)
 
 
 def load_settings(dotenv_path: Path | None = None) -> Settings:
@@ -73,7 +80,8 @@ def load_settings(dotenv_path: Path | None = None) -> Settings:
         planner_include_summary=_bool("PVZ_PLANNER_INCLUDE_SUMMARY", False),
         planner_timeout=float(os.environ.get("PVZ_PLANNER_TIMEOUT", "60")),
         planner_mode=os.environ.get("PVZ_PLANNER_MODE", "split"),
-        # Until seed selection is automated, the loadout is configured (default: level 1-7's cards).
+        # Research pixel games' public card choice and tests only: live play recognizes the cards on
+        # screen (server/seed_packets.py), whatever the operator picked.
         loadout=[p.strip() for p in os.environ.get(
             "PVZ_LOADOUT", "peashooter,sunflower,cherry bomb,wall-nut,potato mine,snow pea").split(",") if p.strip()],
         look_interval=float(os.environ.get("PVZ_LOOK_INTERVAL", "4")),
@@ -84,8 +92,8 @@ def load_settings(dotenv_path: Path | None = None) -> Settings:
         qwen_model=os.environ.get("PVZ_QWEN_MODEL", "Qwen3.8-27B"),
         decider=os.environ.get("PVZ_DECIDER", "rules"),
         # 27B bare decision API; legacy 0.8B /v1/systemone remains supported explicitly.
-        onejev_url=os.environ.get("PVZ_ONEJEV_URL", "http://127.0.0.1:18220/v1/decide"),
-        onejev_model=os.environ.get("PVZ_ONEJEV_MODEL", "autotrust/JEV-27B-VL"),
+        onejev_url=os.environ.get("PVZ_ONEJEV_URL", "http://127.0.0.1:18222/v1/completions"),
+        onejev_model=os.environ.get("PVZ_ONEJEV_MODEL", "AutoTrust-JEV-27B-v1.1"),
         decider_timeout=float(os.environ.get("PVZ_DECIDER_TIMEOUT", "1.0")),
         plan_interval=float(os.environ.get("PVZ_PLAN_INTERVAL", "6")),
         fast_interval=float(os.environ.get("PVZ_FAST_INTERVAL", "1.0")),
@@ -96,6 +104,13 @@ def load_settings(dotenv_path: Path | None = None) -> Settings:
         max_run_bytes=int(os.environ.get("PVZ_MAX_RUN_BYTES", str(2 * 1024**3))),
         auto_native_rsi=_bool("PVZ_AUTO_NATIVE_RSI", True),
         native_evolution=os.environ.get("PVZ_NATIVE_EVOLUTION", "code"),
+        native_coach_actions=int(os.environ.get("PVZ_NATIVE_COACH_ACTIONS", "20")),
+        native_coach_tests=int(os.environ.get("PVZ_NATIVE_COACH_TESTS", "2")),
+        coach_provider=os.environ.get("PVZ_COACH_PROVIDER", "qwen"),
+        coach_model=os.environ.get("PVZ_COACH_MODEL", "gpt-6-astra"),
+        coach_queue_dir=Path(os.environ.get("PVZ_COACH_QUEUE_DIR", str(ROOT / "data/codex_coach"))),
+        coach_timeout=float(os.environ.get("PVZ_COACH_TIMEOUT", "240")),
+        system0_actions=_bool("PVZ_SYSTEM0_ACTIONS", True),
     )
 
 

@@ -80,6 +80,7 @@ class EngineerWorkspace:
             raise ValueError("read-only documents overlap editable files")
         self.seeds, self.controls = list(seeds), controls
         self.tests = 0
+        self.max_tests = MAX_TESTS
         self.tested_version = None
         snapshot(root / "before", self.original)
         snapshot(root / "work", self.files)
@@ -115,7 +116,7 @@ class EngineerWorkspace:
         if action.action == "check":
             return {"valid": True, "version": version}
         if action.action == "test_candidate":
-            if self.tests >= MAX_TESTS:
+            if self.tests >= self.max_tests:
                 raise ValueError("development test budget exhausted")
             self.tests += 1
             path = self.root / f"test{self.tests}-candidate.py"
@@ -126,7 +127,7 @@ class EngineerWorkspace:
             self.tested_version = version
             from rsi.code_coach import development_summary
             return {"version": version, "development": development_summary(result),
-                    "tests_remaining": MAX_TESTS - self.tests}
+                    "tests_remaining": self.max_tests - self.tests}
         if action.action == "finish":
             if not action.diagnosis.strip() or not action.rationale.strip():
                 raise ValueError("finish requires diagnosis and rationale")

@@ -2,6 +2,9 @@
 import math
 
 COUNTS = {"development": 8, "confirmation": 12, "audit": 12}
+TARGETED_COUNTS = {"development": 6, "confirmation": 6, "audit": 6}
+LEVEL_COUNTS = {"development": 1, "confirmation": 0, "audit": 0}
+COUNTS_BY_GATE = {"paired-v1": COUNTS, "targeted-v1": TARGETED_COUNTS, "level-v1": LEVEL_COUNTS}
 SCORE_VERSION = "native-win-progress-mowers-v1"
 
 
@@ -16,13 +19,14 @@ def episode_score(outcome, progress, elapsed_s, mower_times):
     return max(0.0, base - sum(.1 + .1 * math.exp(-t / 60) for t in mower_times))
 
 
-def compare(base, candidate, stage):
+def compare(base, candidate, stage, gate="paired-v1"):
     from rules.code_gate import compare as code_compare
-    if stage not in COUNTS:
+    counts = COUNTS_BY_GATE.get(gate)
+    if counts is None or stage not in counts:
         raise ValueError("unknown stage")
     left, right = base.get("episodes", []), candidate.get("episodes", [])
     reason = None
-    if len(left) != COUNTS[stage] or len(right) != COUNTS[stage]:
+    if len(left) != counts[stage] or len(right) != counts[stage]:
         reason = "incomplete episode count"
     elif base.get("environment") != candidate.get("environment"):
         reason = "environment mismatch"
@@ -46,4 +50,4 @@ def compare(base, candidate, stage):
     except (KeyError, TypeError, ValueError):
         return {"passed": False, "stage": stage, "reason": "score does not match game facts"}
     # Existing development/confirmation/audit statistical rules; scores are in [0,1].
-    return code_compare(base, candidate, stage)
+    return code_compare(base, candidate, stage, gate)

@@ -16,6 +16,12 @@ from rsi.code_store import write_json
 
 async def request_role(role: str, messages: list[dict], schema: type[BaseModel], settings,
                        *, controls: Path, audit_dir: Path) -> tuple[BaseModel, dict]:
+    provider = getattr(settings, 'coach_provider', 'qwen')
+    if role in {"coach", "live_coach"} and provider == "codex":
+        from rsi.codex_queue import request_coach
+        return await request_coach(role, messages, schema, settings, controls=controls, audit_dir=audit_dir)
+    if role in {"coach", "live_coach"} and provider != "qwen":
+        raise ValueError("unsupported coach provider")
     if sys.platform != "linux":
         raise RuntimeError("Model calls must run on the configured Linux server")
     if (controls / "STOP").exists() or (controls / "PAUSE").exists():

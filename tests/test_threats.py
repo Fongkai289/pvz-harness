@@ -3,7 +3,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from server.scene import Zombie
-from server.threats import observed_threats, threat_changes
+from server.threats import observed_threats
 from server.planner import Plan, PlanResult
 from tests.test_action_selector import session
 from tests.test_server import settings
@@ -12,37 +12,25 @@ from tests.test_server import settings
 def test_bottom_row_detected_without_omniscient_state(session):
     scene = session.latest_scene.model_copy(update={"zombies": [Zombie(type="normal", row=4)], "nearest_col": {4: 8}})
     rows = observed_threats(scene, {}, True)
-    assert "第5行" in threat_changes([], rows)["4"]
-    assert not threat_changes(rows, rows)  # unchanged observations never keep retriggering
-    scene.nearest_col = {4: 3}
-    near = observed_threats(scene, {}, True)
-    assert "向房屋移动" in threat_changes(rows, near)["4"]
-    assert "level" not in near[4]
+    assert rows[4]["types"] == ["normal"] and rows[4]["nearest_col"] == 8 and rows[4]["attackers"] == 0
+    assert "level" not in rows[4]
 
 
 def test_missing_layout_is_unknown_not_an_empty_defense(session):
     rows = observed_threats(session.latest_scene, {}, False)
-    assert rows[2]["attackers"] is None
-    assert "出现无攻击植物" not in str(threat_changes([], rows))  # unknown coverage, not zero
+    assert rows[2]["attackers"] is None  # unknown coverage, not zero
     full = observed_threats(session.latest_scene, {(2, 2): ["peashooter"]}, True)
-    empty = observed_threats(session.latest_scene, {}, True)
-    assert "防线消失" in threat_changes(full, empty)["2"]
+    assert full[2]["attackers"] == 1
 
 
-def test_new_resources_request_new_guidance_without_blocking_actions(session):
+def test_resource_and_threat_changes_alone_never_request_a_plan(session):
     session.directive = Plan(objective="save", spend_limit=0)
     session._accept_scene(session.latest_scene, session.scene_received)
-    session._plan_requested.clear()
-    session._plan_reasons.clear()
-    assert not session._plan_requested.is_set()
-    newer = session.latest_scene.model_copy(update={"sun": 125, "frame_id": 2})
+    newer = session.latest_scene.model_copy(update={"sun": 125, "frame_id": 2,
+        "zombies": [Zombie(type="conehead", row=1)], "nearest_col": {1: 3}})
     session._accept_scene(newer, session.scene_received)
-    assert session._plan_requested.is_set()
-    assert "resources" in session._plan_reasons
-    session._plan_requested.clear()
-    session._plan_reasons.clear()
-    session._accept_scene(newer, session.scene_received)
-    assert not session._plan_requested.is_set()
+    # Sun income is Jev's to act on; new zombies are System0's call against replan_when.
+    assert not session._plan_requested.is_set() and not session._plan_reasons
     session.directive = Plan(objective="defend", spend_limit=100)
     # budget-checking never itself sends a click or rewrites a plan
     assert session.ws.sent == []
@@ -89,6 +77,7 @@ def test_trigger_wakes_timer_and_inflight_changes_are_coalesced(session, monkeyp
             active[0] -= 1
             return PlanResult(plan=Plan(objective="replan"), latency=.005)
         monkeypatch.setattr(session, "_plan", plan)
+        monkeypatch.setattr("server.session.event_spacing", lambda seconds: .04)
         monkeypatch.setattr(session, "_fresh_obs", lambda: session.latest_obs)
         # Prove the event wakes a long periodic timer, then enforces minimum spacing.
         monkeypatch.setattr(session, "_plan_delay", lambda: 20)

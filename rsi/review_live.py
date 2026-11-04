@@ -21,6 +21,7 @@ from rsi.code_model import request_role
 from rsi.code_store import write_json
 from rsi.coach import player_profile
 from rsi.decision_evidence import decision_snapshots
+from rsi.postgame import analyze_live
 from rules.playbook_rules import Playbook
 from server.config import load_settings
 
@@ -89,6 +90,14 @@ def sample_rows(rows, limit):
     return [rows[i * (len(rows) - 1) // (limit - 1)] for i in range(limit)]
 
 
+def live_tables(events):
+    """Costly moments, missed chances, decision statistics and Planner->Jev alignment, player view."""
+    try:
+        return analyze_live(events)
+    except (KeyError, TypeError, ValueError, IndexError) as exc:
+        return {"error": f"post-game tables unavailable: {type(exc).__name__}"}
+
+
 def build_evidence(events):
     groups = {}
     for i, event in enumerate(events):
@@ -133,6 +142,7 @@ def build_evidence(events):
                    for kind, limit in (("plan", 18), ("scene", 18), ("zombies", 18), ("plants", 10), ("jev", 30),
                                        ("cmd", 20), ("exec", 12), ("sun_collection", 12))},
         "joined_planting_decisions": sample_rows([d for d in decisions if d["placement"] and not d["rejected"]], 12),
+        "postgame": live_tables(events),
         "limitations": ["Scene/plant labels are model observations, not verified ground truth.",
                         "Mower times before the segment's initial game clock are historical.",
                         "Only an explicit outcome in judge state establishes win/loss; connection closure does not.",

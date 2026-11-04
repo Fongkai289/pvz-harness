@@ -8,7 +8,8 @@ helpers. Helpers must not expose files, networking, judge state, or metrics.
 No image libraries are imported here; the host owns the pixels API.
 
 A source contains only top-level functions (and optional docstrings). It must
-define perceive(image) and decide(observation, memory). Extra functions, literal
+define perceive(image) and decide(observation, memory); options(observation, memory),
+act(observation, memory, decision) and reflex(observation, memory) are optional. Extra functions, literal
 scalar defaults, inert type annotations, and bounded for/comprehension iteration
 are supported. Module state, imports, classes, while, decorators, dynamic calls,
 and attribute access other than checked data-method calls are forbidden.
@@ -32,6 +33,11 @@ MAX_MEMORY_BYTES = 64 * 1024
 MAX_JSON_DEPTH = 32
 MAX_JSON_NODES = 10_000
 MAX_ITERATIONS = 100_000
+
+
+# Required entries, then optional System0 entries (decision menu, its execution, reflexes).
+ENTRY_ARITY = {"perceive": 1, "decide": 2, "options": 2, "act": 3, "reflex": 2, "fallback": 2}
+OPTIONAL_ENTRIES = ("options", "act", "reflex", "fallback")
 
 
 class CandidateValidationError(ValueError):
@@ -287,7 +293,7 @@ def validate_source(source: str, helper_names: Iterable[str] = ()) -> CodeType:
     helpers = set(helper_names)
     for name in helpers:
         _check_name(name)
-        if name in _SAFE_BUILTINS or name in {"perceive", "decide"}:
+        if name in _SAFE_BUILTINS or name in ENTRY_ARITY:
             raise CandidateValidationError(f"reserved helper name: {name}")
     functions: dict[str, ast.FunctionDef] = {}
     for node in tree.body:
@@ -310,7 +316,7 @@ def validate_source(source: str, helper_names: Iterable[str] = ()) -> CodeType:
             positional = args.posonlyargs + args.args
             if args.vararg or args.kwarg or args.kwonlyargs:
                 raise CandidateValidationError("functions require fixed positional parameters")
-            required = {"perceive": 1, "decide": 2}.get(name)
+            required = ENTRY_ARITY.get(name)
             if required is not None and (len(positional) != required or args.defaults):
                 raise CandidateValidationError(f"{name} requires exactly {required} parameters")
             for arg in positional:
@@ -365,6 +371,27 @@ class CandidateProgram:
         exec(code, namespace, namespace)
         self._perceive = namespace["perceive"]
         self._decide = namespace["decide"]
+        self._optional = {name: namespace[name] for name in OPTIONAL_ENTRIES if name in namespace}
+
+    @property
+    def entries(self) -> frozenset[str]:
+        return frozenset({"perceive", "decide", *self._optional})
+
+    def call(self, entry: str, observation: dict, memory: dict, *extra: Any) -> Any:
+        """Call an optional entry (options/act/reflex) with the same memory checks as decide."""
+        if entry not in self._optional:
+            raise CandidateOutputError(f"player code does not define {entry}")
+        if type(observation) is not dict or type(memory) is not dict:
+            raise CandidateOutputError("observation and memory must be plain dicts")
+        _check_json(observation, "observation")
+        _check_json(memory, "memory", MAX_MEMORY_BYTES)
+        _check_json(list(extra), "arguments")
+        try:
+            result = self._optional[entry](observation, memory, *extra)
+        finally:
+            _check_json(memory, "memory", MAX_MEMORY_BYTES)
+        _check_json(result, entry)
+        return result
 
     def perceive(self, image: Any) -> dict:
         observation = self._perceive(image)

@@ -103,7 +103,8 @@ def unpack_source(source: str, helper_names=None) -> dict[str, str]:
     for node in ast.parse(source).body:
         if isinstance(node, ast.FunctionDef):
             path = {"perceive": FILES[0], "decide": FILES[3],
-                    "free": FILES[2], "ready": FILES[2], "place": FILES[2]}.get(node.name, FILES[4])
+                    "free": FILES[2], "ready": FILES[2], "place": FILES[2],
+                    "options": FILES[2], "act": FILES[2], "reflex": FILES[2]}.get(node.name, FILES[4])
             parts[path].append(ast.get_source_segment(source, node))
     result = {path: "\n\n".join(parts[path]) + "\n" for path in FILES}
     compile_bundle(result, helper_names)

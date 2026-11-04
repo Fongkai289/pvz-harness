@@ -3,6 +3,17 @@ import asyncio
 import json
 import httpx
 
+REVIEW_LIST = 8  # recent games in the 赛后复盘 list
+
+REVIEW_STATES = {"not_triggered": "尚无赛后复盘", "queued": "等待复盘", "reviewing": "Coach 正在复盘",
+                 "completed": "复盘完成 · 待你确认下一局", "failed": "复盘失败",
+                 "skipped": "无需复盘 · 胜利且没用小推车"}
+LEARNING_STATES = {"not_triggered": "等待真实对局复盘", "waiting_runtime": "等待 Windows 评测环境",
+                   "evaluating": "多局评测中", "coaching": "Coach 正在生成候选", "promoted": "候选通过，下一次连接生效",
+                   "rejected": "候选未通过，保留旧版本", "failed": "本轮失败，保留旧版本",
+                   "stale": "当前版本已改变，停止旧候选晋升", "stopped": "本轮已停止", "blocked": "评测受阻，保留旧版本",
+                   "engineering": "Engineer 检查与修改代码", "engineer_testing": "Engineer 代码正在 pvz_rl 开发集测试"}
+
 
 class OperatorView:
     def __init__(self, url, token):
@@ -15,14 +26,26 @@ class OperatorView:
         self.mechanics = None
         self.mechanics_error = None
         self.learning = {"status": "not_triggered"}
+        self.coach_usage = {"rounds": []}
+        self.reviews = []  # recent games' reviews, newest first (a server without /reviews leaves this empty)
 
     async def run(self):
         async with httpx.AsyncClient(timeout=3, trust_env=False) as client:
+            rounds = 0
             while True:
+                if rounds % 5 == 0:  # every ~10 s: the list changes only when a game ends
+                    try:
+                        listed = await client.get(self.base + "/reviews", params={"limit": REVIEW_LIST},
+                                                  headers={"Authorization": f"Bearer {self.token}"}, timeout=10)
+                        listed.raise_for_status()
+                        self.reviews = listed.json()
+                    except httpx.HTTPError:
+                        pass  # the latest review below still shows
+                rounds += 1
                 try:
-                    review, book, decisions, learning = await asyncio.gather(*[
+                    review, book, decisions, learning, usage = await asyncio.gather(*[
                         client.get(self.base + path, headers={"Authorization": f"Bearer {self.token}"})
-                        for path in ("/reviews/latest", "/playbook", "/decisions/latest", "/learning/latest")])
+                        for path in ("/reviews/latest", "/playbook", "/decisions/latest", "/learning/latest", "/coach/usage")])
                     review.raise_for_status()
                     book.raise_for_status()
                     decisions.raise_for_status()
@@ -30,6 +53,8 @@ class OperatorView:
                     self.review, self.playbook = review.json(), book.json()
                     self.decisions = decisions.json()
                     self.learning = learning.json()
+                    usage.raise_for_status()
+                    self.coach_usage = usage.json()
                     self.error = None
                 except httpx.HTTPError as exc:
                     self.error = type(exc).__name__
@@ -179,23 +204,51 @@ class OperatorView:
         return (f"#{item.get('decision_id') or '未调用'} {choice} · {item.get('reason', '')}"
                 + (f" · 未执行：{blocked}" if blocked else ""))
 
+    def review_views(self):
+        """Recent games for the 赛后复盘 list, newest first; the latest one from its faster 2 s refresh."""
+        rows = [{**r, **self.review} if r.get("session") == self.review.get("session") else r for r in self.reviews]
+        if self.review.get("session") and all(r.get("session") != self.review.get("session") for r in rows):
+            rows.insert(0, self.review)
+        return [self.review_view(r) for r in rows or [self.review]]
+
+    def review_view(self, r=None):
+        """赛后复盘 as fields for the control center's cards; review_text() keeps the plain form."""
+        r = self.review if r is None else r
+        record = r.get("review") or {}
+        coach = record.get("coach") or {}
+        def listed(value, limit):
+            return [str(x) for x in value][:limit] if isinstance(value, list) else ([str(value)] if value else [])
+        return {"status": r.get("status", "not_triggered"), "label": REVIEW_STATES.get(r.get("status"), "等待状态"),
+                "session": r.get("session"), "result": r.get("result"), "model": (record.get("model_call") or {}).get("model"),
+                "diagnosis": coach.get("diagnosis"), "objective": coach.get("objective"),
+                "evidence": listed(coach.get("evidence"), 8), "uncertainties": listed(coach.get("uncertainties"), 6),
+                "error": r.get("error"), "refresh_error": self.error, "skipped": r.get("native_rsi_skipped"),
+                "usage": [{"round": row["round_id"].rsplit("/", 1)[-1], "calls": row["tokens"].get("calls"),
+                           **{k: row["tokens"].get(k) for k in ("input_tokens", "cached_input_tokens",
+                                                                "output_tokens", "total_tokens")}}
+                          for row in self.coach_usage.get("rounds", [])[-6:]]}
+
     def review_text(self):
-        states = {"not_triggered": "尚无赛后复盘", "queued": "等待复盘", "reviewing": "Coach 正在复盘",
-                  "completed": "复盘完成 · 待你确认下一局", "failed": "复盘失败"}
         r = self.review
-        return (states.get(r.get("status"), "等待状态") + "\n"
+        return (REVIEW_STATES.get(r.get("status"), "等待状态") + "\n"
                 + (f"状态刷新失败：{self.error}（保留上次结果）\n" if self.error else "")
                 + r.get("text", r.get("error", "胜利或失败后会自动触发；暂停不会触发。"))
-                + "\n\n自动 RSI · pvz_rl\n" + self.learning_text())
+                + "\n\n自动 RSI · pvz_rl\n" + self.learning_text()
+                + "\n\n" + self.coach_usage_text())
+
+    def coach_usage_text(self):
+        lines = ['Coach Token（不含 Planner / Qwen / Jev；缓存包含在输入中）']
+        for row in self.coach_usage.get('rounds', [])[-6:]:
+            tokens = row['tokens']
+            show = lambda key: '未知' if tokens.get(key) is None else f"{tokens[key]:,}"
+            lines.append(f"{row['round_id']} · {tokens['calls']} 次调用\n"
+                         f"输入 {show('input_tokens')}（缓存 {show('cached_input_tokens')}） · "
+                         f"输出 {show('output_tokens')} · 总计 {show('total_tokens')}")
+        return '\n'.join(lines) if len(lines)>1 else lines[0]+'\n尚无调用记录'
 
     def learning_text(self):
         data = self.learning
-        states = {"not_triggered":"等待真实对局复盘", "waiting_runtime":"等待 Windows 评测环境",
-                  "evaluating":"多局评测中", "coaching":"Coach 正在生成候选", "promoted":"候选通过，下一次连接生效",
-                  "rejected":"候选未通过，保留旧版本", "failed":"本轮失败，保留旧版本", "stale":"当前版本已改变，停止旧候选晋升",
-                  "stopped":"本轮已停止", "blocked":"评测受阻，保留旧版本",
-                  "engineering":"Engineer 检查与修改代码", "engineer_testing":"Engineer 代码正在 pvz_rl 开发集测试"}
-        return (states.get(data.get("status"), data.get("status", "未知"))
+        return (LEARNING_STATES.get(data.get("status"), data.get("status", "未知"))
                 + (" · 已暂停" if data.get("paused") else "")
                 + f"\n原策略 {data.get('parent', '—')} · 候选 {data.get('candidate') or '尚未生成'}"
                 + "\n" + str(data.get("detail") or data.get("reason") or "state 对比、独立种子确认、截图审计全部合格后才晋升。")

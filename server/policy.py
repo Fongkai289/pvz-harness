@@ -55,6 +55,15 @@ class FastPolicy:
             clicks.append(Click(cx, cy, f"plant at row {p.row} col {p.col}"))
         return clicks
 
+    def shovel_clicks(self, shovel_x: int, row: int, col: int) -> list[Click]:
+        """Pick up the shovel, then click the plant's cell; empty for invalid coordinates."""
+        try:
+            sx, sy = geometry.shovel_center(shovel_x)
+            cx, cy = geometry.cell_center(row, col, self._rows)
+        except ValueError:
+            return []
+        return [Click(sx, sy, "pick up shovel"), Click(cx, cy, f"dig up row {row} col {col}")]
+
     def sun_candidates(self, obs: Observation, now: float | None = None) -> list[Click]:
         """Enumerating options does not consume cooldown or authorize a click."""
         now = time.monotonic() if now is None else now

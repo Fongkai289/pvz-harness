@@ -112,6 +112,16 @@ function Write-SshEvent {
     [IO.File]::AppendAllText($Path, $line, [Text.UTF8Encoding]::new($false))
 }
 
+function Read-SharedText {
+    param([string]$Path)
+    # ssh keeps its -E log open for writing; File.ReadAllText refuses to share with a writer.
+    try {
+        $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+            [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+    } catch [IO.IOException] { return '' }
+    try { return [IO.StreamReader]::new($stream).ReadToEnd() } finally { $stream.Dispose() }
+}
+
 function ConvertTo-NativeCommandLine {
     param([string[]]$Arguments)
     # Windows C argv quoting. PowerShell 5's native invocation otherwise drops
@@ -196,7 +206,7 @@ function Invoke-StableSsh {
             $announced = $false
             while (-not $process.WaitForExit(250)) {
                 if ($Mode -eq 'Tunnel' -and -not $announced) {
-                    $progress = [IO.File]::ReadAllText($debugLog)
+                    $progress = Read-SharedText $debugLog
                     if ($progress -match 'Entering interactive session' -and $progress -match 'Local forwarding listening') {
                         Write-Host 'Tunnel connected. Keep this window open; Ctrl+C stops it.'
                         $announced = $true
@@ -204,7 +214,7 @@ function Invoke-StableSsh {
                 }
             }
             $connectionExit = $process.ExitCode
-            $debugText = [IO.File]::ReadAllText($debugLog)
+            $debugText = Read-SharedText $debugLog
             $outcome = Get-SshOutcome $connectionExit $debugText $Mode
         } finally {
             if ($null -ne $process) {

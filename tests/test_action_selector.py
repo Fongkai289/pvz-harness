@@ -29,13 +29,18 @@ def test_planner_schema_rejects_placement_and_interface_fields(field, value):
         Plan(objective="defend", **{field: value})
 
 
-@pytest.mark.parametrize("fields", [{"priority_rows": [1, 1]}, {"blocked_rows": [-1]},
+@pytest.mark.parametrize("fields", [{"blocked_rows": [-1]},
                                      {"priority_rows": [6]}, {"sun_reserve": -1},
                                      {"spend_limit": True}, {"valid_for_seconds": 0},
                                      {"priority_rows": [2], "blocked_rows": [2]}])
 def test_planner_constraints_are_validated(fields):
     with pytest.raises(ValidationError):
         Plan(objective="defend", **fields)
+
+
+def test_repeated_planner_advice_is_deduplicated_in_order():
+    plan = Plan(objective="defend", priority_rows=[3, 1, 3], blocked_rows=[0, 0])
+    assert plan.priority_rows == [3, 1] and plan.blocked_rows == [0]
 
 
 def test_candidates_include_all_available_columns_and_plant_types():
@@ -210,9 +215,9 @@ def session(settings):
 def test_actual_model_choice_reaches_clicks_and_consumes_guidance_budget(session):
     from server import geometry
     async def run():
-        place = await session._jev_step(session.latest_obs)
-        assert place == Placement(slot=1, row=3, col=7)
-        await session._execute_placement(place)
+        decision = await session._jev_step(session.latest_obs)
+        assert decision == (Placement(slot=1, row=3, col=7), None)
+        await session._execute_placement(*decision)
         assert session.directive_spent == 50 and session.sun_spent == 50
         assert await session._jev_step(session.latest_obs) is None
     asyncio.run(run())
@@ -242,9 +247,9 @@ def test_inflight_decision_is_rechecked_before_clicking(session, change):
 
 def test_executor_checks_again_after_selection(session):
     async def run():
-        place = await session._jev_step(session.latest_obs)
+        decision = await session._jev_step(session.latest_obs)
         session.directive = Plan(objective="wait", spend_limit=0)
-        await session._execute_placement(place)
+        await session._execute_placement(*decision)
     asyncio.run(run())
     assert session.ws.sent == [] and session.directive_spent == 0
 
@@ -285,10 +290,11 @@ def test_planner_refresh_leads_expiry_and_does_not_extend_budget(session):
     session.settings = replace(session.settings, plan_interval=20)
     session.directive = Plan(objective="test", valid_for_seconds=15, spend_limit=0)
     session._planner_latency = 3
-    delay = session._plan_delay()
-    assert 10 <= delay <= 10.5
+    assert 24.5 <= session._plan_delay() <= 25  # routine floor; a 15 s validity is raised to 40 s
+    session._planner_latency = 12  # a slow shared model: start early enough to land before the 40 s lapse
+    assert 21.5 <= session._plan_delay() <= 22
     assert session.directive.spend_limit == 0
-    session.directive_received -= 16
+    session.directive_received -= 41
     assert session._decision_context() is None
     assert "过期" in session._decision_block_reason()
 

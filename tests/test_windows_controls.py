@@ -1,5 +1,6 @@
 """Client-only controls, tested without manipulating the real game or mouse."""
 import asyncio
+import time
 import sys
 from unittest.mock import Mock
 
@@ -183,11 +184,10 @@ def test_main_reconnects_after_manual_game_recovery_without_game_commands(monkey
 
 def test_button_states_and_end_preserve_window_and_results():
     panel = wc.ControlPanel(Mock())
-    panel._root = Mock()
     assert panel.client_state() == "未开始"
-    assert panel.button_states() == {"开始": True, "暂停": False, "继续": False, "结束": False}
+    assert panel.button_states() == {"开始": True, "暂停": False, "继续": False, "结束": False, "选植物": False, "测试连接": False}
     panel._on_start()
-    assert panel.button_states() == {"开始": False, "暂停": True, "继续": False, "结束": True}
+    assert panel.button_states() == {"开始": False, "暂停": True, "继续": False, "结束": True, "选植物": False, "测试连接": False}
     panel.link = Mock()
     panel.sessions.append("previous")
     panel.link_active.set()
@@ -200,9 +200,9 @@ def test_button_states_and_end_preserve_window_and_results():
     panel._on_resume()
     panel._on_stop()
     assert panel.client_state() == "已结束" and panel.held()
-    assert panel.button_states() == {"开始": True, "暂停": False, "继续": False, "结束": False}
+    assert panel.button_states() == {"开始": True, "暂停": False, "继续": False, "结束": False, "选植物": False, "测试连接": False}
     assert panel.sessions == ["previous"] and panel.link is not None
-    panel._root.destroy.assert_not_called()
+    assert not panel.stop.is_set()
     panel._on_start()
     assert panel.client_state() == "等待游戏就绪"
 
@@ -302,3 +302,112 @@ def test_second_client_exits_before_taking_over_game(monkeypatch):
     asyncio.run(wc.main())
     game.assert_not_called()
     mutex.Close.assert_called_once()
+
+
+def test_a_rejected_token_is_named_instead_of_a_bare_disconnect():
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+    rejected = ConnectionClosedError(Close(1008, "bad hello or token"), None)
+    assert "令牌不对" in wc.disconnect_message(rejected)
+    assert "连接中断（ConnectionClosedError）" in wc.disconnect_message(ConnectionClosedError(None, None))
+    assert "连接中断（OSError）" in wc.disconnect_message(OSError())
+
+
+def test_control_window_sits_beside_the_game_inside_the_work_area():
+    from client.app_window import placement
+    work = (0, 0, 1920, 1040)
+    assert placement((100, 50, 800, 600), work) == (916, 50, 760, 900)  # right of the game
+    assert placement((1100, 50, 800, 600), work) == (324, 50, 760, 900)  # no room on the right
+    assert placement((100, 500, 800, 600), (0, 0, 1366, 728)) == (916, 0, 450, 728)  # clamped to a small screen
+    assert placement((100, 50, 1400, 1050), (0, 0, 3840, 2100), 1.75) == (1516, 50, 1330, 1575)  # high DPI
+
+
+def test_control_window_title_matches_the_page():
+    from client.app_window import ROOT, TITLE
+    assert f"<title>{TITLE}</title>" in (ROOT / "client/operator_dashboard.html").read_text(encoding="utf-8")
+
+
+def test_a_network_drop_reconnects_by_itself_but_a_refused_token_waits_for_the_operator(monkeypatch):
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+    game = Mock()
+    game.ready.return_value = True
+    calls, seen = [], []
+    class Panel(wc.ControlPanel):
+        def start(self):
+            self._on_start()
+        def close(self):
+            self._on_close()
+    panel = Panel(game)
+    class Link:
+        game_outcome = None
+        model_activity = Mock()
+        def __init__(self, *args, **kwargs):
+            self.session_id = None
+        async def run(self, *, done):
+            calls.append(time.monotonic())
+            if len(calls) == 1:
+                raise TimeoutError()  # handshake lost in a stalled tunnel
+            seen.append((panel.paused.is_set(), panel.message))
+            if len(calls) == 2:
+                raise ConnectionClosedError(Close(1008, "bad hello or token"), None)
+        def latency_summary(self):
+            return {}
+    async def stop_when_paused():
+        while not panel.paused.is_set() or len(calls) < 2:
+            await asyncio.sleep(.05)
+        seen.append(panel.message)
+        panel._on_close()
+    async def run():
+        task = asyncio.create_task(stop_when_paused())
+        await wc.main()
+        await task
+    monkeypatch.setattr(sys, "argv", ["windows_client", "--token", "test-only"])
+    monkeypatch.setattr(wc.win32event, "CreateMutex", Mock(return_value=Mock()))
+    monkeypatch.setattr(wc.win32api, "GetLastError", lambda: 0)
+    monkeypatch.setattr(wc, "make_dpi_aware", lambda: None)
+    monkeypatch.setattr(wc, "GameWindow", lambda: game)
+    monkeypatch.setattr(wc, "MowerMonitor", Mock(side_effect=OSError("not available")))
+    monkeypatch.setattr(wc, "ControlPanel", lambda _: panel)
+    monkeypatch.setattr(wc, "ServerLink", Link)
+    asyncio.run(run())
+    assert len(calls) == 2 and calls[1] - calls[0] >= 1.9  # retried after the 2 s backoff, no click needed
+    assert seen[0] == (False, "网络中断（TimeoutError）；2 秒后自动重连（第 1 次）")
+    assert "令牌不对" in seen[-1]  # paused for the operator, no automatic retry
+
+
+def test_client_runs_without_the_game_and_attaches_when_it_opens(monkeypatch):
+    game = Mock()
+    game.hwnd = 42
+    game.ready.return_value = False
+    lookups, seen = [], []
+    def window():
+        lookups.append(time.monotonic())
+        if len(lookups) < 3:
+            raise RuntimeError("window not found: MainWindow 'Plants vs. Zombies'")
+        return game
+    class Panel(wc.ControlPanel):
+        def start(self):
+            seen.append((type(self.game).__name__, self.message, self.button_states()["选植物"]))
+        def close(self):
+            self._on_close()
+    panels = []
+    monkeypatch.setattr(sys, "argv", ["windows_client", "--token", "test-only"])
+    monkeypatch.setattr(wc.win32event, "CreateMutex", Mock(return_value=Mock()))
+    monkeypatch.setattr(wc.win32api, "GetLastError", lambda: 0)
+    monkeypatch.setattr(wc, "make_dpi_aware", lambda: None)
+    monkeypatch.setattr(wc, "GameWindow", window)
+    monkeypatch.setattr(wc, "ControlPanel", lambda g: panels.append(Panel(g)) or panels[-1])
+    async def run():
+        async def close_once_attached():
+            while not panels or panels[0].game is not game:
+                await asyncio.sleep(.05)
+            seen.append(panels[0].message)
+            panels[0]._on_close()
+        task = asyncio.create_task(close_once_attached())
+        await asyncio.wait_for(wc.main(), timeout=10)
+        await task
+    asyncio.run(run())
+    assert seen[0] == ("MissingGame", wc.NO_GAME, False)  # the control center runs; no seed clicks without a game
+    assert panels[0].game is game and "已接上" in seen[1]
+    game.set_topmost.assert_any_call(True)

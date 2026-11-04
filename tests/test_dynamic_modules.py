@@ -33,7 +33,8 @@ def test_create_merge_split_and_rename_preserve_executable_interfaces(workspace)
     assert not (workspace.root/'work/player/vision/rows.py').exists()
     workspace.dispatch(action('edit_modules', deletes=['player/all.py'], writes={
         'player/input.py': perception + '\n' + helper,
-        'player/decision/main.py': unpack_source(SEED, ())['player/policy.py']}))
+        'player/decision/main.py': 'def decide(observation, memory):\n'
+                                   '    return {"planner_context": {}, "jev_context": {}, "request_replan": False}\n'}))
     source = compile_bundle(workspace.files, ())
     assert len(workspace.files) == 2
     assert CandidateProgram(source).perceive({}) == {'rows': [4]}
@@ -96,7 +97,7 @@ def test_deletion_manifest_version_gate_and_resume(workspace):
 @pytest.mark.parametrize('duplicate', [False, True])
 def test_entry_interfaces_still_required_exactly_once(workspace, duplicate):
     if duplicate:
-        workspace.dispatch(action('write_file', path='player/extra.py', content=SEED))
+        workspace.dispatch(action('write_file', path='player/extra.py', content='def perceive(image):\n    return image\n'))
     else:
         workspace.dispatch(action('delete_file', path='player/perception.py'))
     with pytest.raises(ValueError):

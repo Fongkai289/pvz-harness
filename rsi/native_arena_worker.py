@@ -29,6 +29,12 @@ def main():
                     result = arena.reset(request['level'],request['seed'])
                 elif op == 'step' and arena:
                     result = arena.step(request['placement'])
+                elif op == 'shovel' and arena:
+                    result = arena.shovel(request['cell'])
+                elif op == 'prepare' and arena:
+                    result = arena.prepare(request['level'], request['seed'])
+                elif op == 'choose' and arena:
+                    result = arena.choose(request['plants'])
                 elif op == 'pixels' and arena:
                     result = base64.b64encode(arena.pixels()).decode()
                 else:
