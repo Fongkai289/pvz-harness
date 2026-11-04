@@ -2,9 +2,13 @@
 import json
 import argparse
 from pathlib import Path
+import sys
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from common.project_paths import load_runtime_config
 from rsi.portable_runtime import PortableArena
 
-config=json.loads(Path('data/portable_rsi/config.json').read_text(encoding='utf-8-sig'))
+config=load_runtime_config('data/portable_rsi/config.json')
 parser=argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--parity',action='store_true')
 args=parser.parse_args()
@@ -13,7 +17,7 @@ try:
     for level in ([] if args.parity else range(1,11)):
         info=arena.reset(level,424242)
         frame=arena.pixels()
-        path=Path('data/portable_rsi')/f'level-{level}-initial.jpg'; path.write_bytes(frame)
+        path=ROOT/'data/portable_rsi'/f'level-{level}-initial.jpg'; path.write_bytes(frame)
         print(json.dumps(dict(level=level,clock=info['game_clock'],
             cards=info['raw_observation']['cards'],image_bytes=len(frame))),flush=True)
     if args.parity:
@@ -28,8 +32,8 @@ try:
             paths.append(path)
         result=dict(kind='WAIT-only protocol check',same_seed_equal=paths[0]==paths[1],render_preserves_observations=paths[0]==paths[2],
                     final_tick=paths[0][-1]['tick'],identity=arena.identity)
-        Path('data/portable_rsi/render-parity.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
-        Path('data/portable_rsi/render-traces.json').write_text(json.dumps(paths),encoding='utf-8')
+        (ROOT/'data/portable_rsi/render-parity.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
+        (ROOT/'data/portable_rsi/render-traces.json').write_text(json.dumps(paths),encoding='utf-8')
         print(json.dumps(result),flush=True)
         assert result['render_preserves_observations']
 finally:

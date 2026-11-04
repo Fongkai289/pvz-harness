@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from rsi.portable_runtime import PortableArena, NAMES  # noqa: E402
 from server import geometry  # noqa: E402
+from common.project_paths import load_runtime_config
 
 LEVELS = (1, 2, 3, 4, 6, 7, 8, 9)  # 1-5 and 1-10 are conveyor-belt levels: no fixed seed bank
 SEEDS = (101, 202)
@@ -24,7 +25,7 @@ MAX_SLOTS = 8
 
 
 def main():
-    config = json.loads((ROOT / 'data/portable_rsi/config.json').read_text(encoding='utf-8-sig'))
+    config = load_runtime_config('data/portable_rsi/config.json')
     out = ROOT / 'data/seed_packets_raw'
     out.mkdir(parents=True, exist_ok=True)
     labels = []

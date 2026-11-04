@@ -7,7 +7,7 @@ import ipaddress
 
 root=Path(__file__).resolve().parents[1]
 ssh=ssh_settings()
-files='''common/local_config.py scripts/remote_config.py rsi/portable_runtime.py rsi/portable_bridge.py rsi/portable_loop.py
+files='''common/local_config.py common/project_paths.py scripts/remote_config.py rsi/portable_runtime.py rsi/portable_bridge.py rsi/portable_loop.py
 rsi/native_runtime.py rsi/native_loop.py rsi/native_jobs.py rsi/native_engineer.py
 rsi/native_bridge.py rsi/native_schedule.py rsi/native_transport.py
 server/scene.py server/action_selector.py rules/hard_rules.py tests/test_portable.py

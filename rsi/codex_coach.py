@@ -297,7 +297,8 @@ def main():
     parser.add_argument('--once',action='store_true'); parser.add_argument('--status',action='store_true')
     parser.add_argument('--lanes',type=int,default=LANES,choices=range(1,5),help='Coach requests answered at once')
     args=parser.parse_args()
-    work(json.loads(Path(args.config).read_text(encoding='utf-8')),Path(args.root),once=args.once,status=args.status,
+    from common.project_paths import load_runtime_config, project_path
+    work(load_runtime_config(args.config),project_path(args.root),once=args.once,status=args.status,
          lanes=args.lanes)
 
 

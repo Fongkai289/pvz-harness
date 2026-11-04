@@ -17,6 +17,7 @@ from pathlib import Path
 import time
 
 from common.file_lock import file_lock
+from common.project_paths import load_runtime_config
 from rsi.code_store import write_json
 from rsi.native_loop import SSHBridge, evaluate_task, control, Stopped
 from rsi.native_jobs import TERMINAL, digest
@@ -346,7 +347,7 @@ def main():
     parser.add_argument('--mode',choices=['campaign','rsi','both','train'],default='both')
     parser.add_argument('--level',type=int,choices=range(1,11),help='train mode: only this level, on a fresh seed')
     args=parser.parse_args()
-    config=json.loads(args.config.read_text(encoding='utf-8-sig'))
+    config=load_runtime_config(args.config)
     root=Path(config['work_dir']); root.mkdir(parents=True,exist_ok=True)
     preflight(config)
     with file_lock(root/'WORKER.lock',blocking=False):

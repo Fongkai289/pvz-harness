@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from common.file_lock import file_lock
 from common.local_config import ssh_settings, remote_command
+from common.project_paths import load_runtime_config, resolve_runtime_paths
 from rsi.code_store import write_json
 from rsi.native_gate import episode_score, SCORE_VERSION
 from rsi.native_jobs import digest, TERMINAL, source_digest
@@ -282,6 +283,7 @@ def _run_episode(arena, task, spec, bridge, root, episode_id, schedule, abort):
 
 
 def evaluate_task(config, task, bridge, *, arena_factory=NativeArena):
+    config = resolve_runtime_paths(config)
     root = Path(config["work_dir"])
     workers = config.get('workers', 1)
     if type(workers) is not int or not 1 <= workers <= 4:
@@ -361,6 +363,7 @@ def evaluate_task(config, task, bridge, *, arena_factory=NativeArena):
 
 
 def run(config, *, watch=False, session=None, retry=False, bridge_factory=SSHBridge, evaluator=evaluate_task):
+    config = resolve_runtime_paths(config)
     root = Path(config["work_dir"]).resolve()
     root.mkdir(parents=True, exist_ok=True)
     with file_lock(root / "WORKER.lock", blocking=False):
@@ -431,7 +434,7 @@ def main():
     args = parser.parse_args()
     if args.retry and not args.session:
         parser.error("--retry requires --session")
-    config = json.loads(args.config.read_text(encoding="utf-8"))
+    config = load_runtime_config(args.config)
     root = Path(config["work_dir"]).resolve()
     root.mkdir(parents=True, exist_ok=True)
     if args.control:

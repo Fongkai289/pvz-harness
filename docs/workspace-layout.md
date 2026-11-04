@@ -63,3 +63,11 @@ Computer Use/
 构建工具通过 Portable 的兄弟目录寻找 `msys64`，不修改全局 PATH。
 
 目录整理不启动任何训练、真实游戏客户端或远程服务。
+
+## 改名或移动工作区
+
+训练配置的 `repository`、`game_executable`、`dll`、`work_dir`、`resources` 和 `runtime_bin` 支持相对路径，统一以 `app/` 为基准，与启动终端的工作目录无关。例如 `../external/PvZ-Portable` 和 `data/portable_rsi/worker`。新生成的训练配置会自动使用相对路径；工作区以外的游戏安装目录仍使用绝对路径。
+
+`local.json` 中的 SSH 私钥相对该配置文件解析；服务器 `remote_dir` 仍是服务器上的绝对路径。不要把本机工作区名称写进源码。
+
+退出占用旧目录的程序后再改名。移动后用 `.venv/Scripts/python.exe scripts/repair_windows_environment.py` 修复 Python 自动生成的激活脚本与命令入口。Portable 的 CMake 缓存也包含生成时的路径：保留旧构建目录作为本地备份，再运行引擎的 `tools/build-harness.ps1` 生成新构建。历史日志、实验报告和备份保留原记录，不进行全目录文本替换。

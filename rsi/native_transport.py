@@ -78,6 +78,8 @@ class ArenaProcess:
         import sys
         from pathlib import Path
         from rsi.native_loop import control
+        from common.project_paths import resolve_runtime_paths
+        config = resolve_runtime_paths(config)
         self.root = Path(config['work_dir'])
         self.log = (self.root/f"arena-{config.get('instance_id',0)}.log").open('a',encoding='utf-8')
         self.process = subprocess.Popen([sys.executable,'-X','utf8','-u','-m','rsi.native_arena_worker'],

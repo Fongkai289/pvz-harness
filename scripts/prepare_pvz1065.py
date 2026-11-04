@@ -106,7 +106,8 @@ def main():
     identity = preflight(config)
     # Destination is new and within the requested workspace by default.
     shutil.copytree(game, args.destination)
-    config['game_executable'] = str((args.destination/'PlantsVsZombies.exe').resolve())
+    from common.project_paths import portable_path
+    config['game_executable'] = portable_path(args.destination/'PlantsVsZombies.exe')
     preflight(config)
     if args.config.read_text(encoding='utf-8-sig') != original_config:
         raise ValueError('Config changed concurrently; game prepared but config not overwritten')

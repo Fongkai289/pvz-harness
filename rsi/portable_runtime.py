@@ -8,6 +8,7 @@ import subprocess
 import uuid
 
 from server.scene import Scene, Card, Zombie
+from common.project_paths import resolve_runtime_paths
 from rsi.native_runtime import PLANTS, ZOMBIES
 
 UPSTREAM = '98b659380014c89c3553fbb2839f5e5a84d6df3d'
@@ -15,6 +16,7 @@ NAMES = dict(enumerate(PLANTS)) | {-1:'empty',49:'explode-o-nut',50:'giant wall-
 
 
 def preflight(config):
+    config=resolve_runtime_paths(config)
     repo=Path(config['repository']).resolve()
     revision=subprocess.check_output(['git','rev-parse','HEAD'],cwd=repo,text=True).strip()
     if revision!=UPSTREAM: raise ValueError('Portable upstream changed')
@@ -54,6 +56,7 @@ def player_state(raw, mask, tick):
 
 class PortableArena:
     def __init__(self,config,mode):
+        config=resolve_runtime_paths(config)
         self.identity=preflight(config)
         self.mode=mode
         repo=Path(config['repository']).resolve()

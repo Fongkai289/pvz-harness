@@ -19,6 +19,8 @@ ZOMBIES = ("normal", "flag", "conehead", "pole vaulting", "buckethead", "newspap
 
 def preflight(config):
     """Only inspect source identity, executable bytes and file presence; no DLL loading."""
+    from common.project_paths import resolve_runtime_paths
+    config = resolve_runtime_paths(config)
     if config.get('backend')=='pvz_portable':
         from rsi.portable_runtime import preflight as portable_preflight
         return portable_preflight(config)
@@ -97,6 +99,8 @@ class NativeArena:
         return super().__new__(cls)
 
     def __init__(self, config, mode):
+        from common.project_paths import resolve_runtime_paths
+        config = resolve_runtime_paths(config)
         if sys.platform != "win32":
             raise RuntimeError("pvz_rl game executor must run on Windows")
         self.identity = preflight(config)

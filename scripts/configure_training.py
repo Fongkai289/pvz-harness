@@ -2,8 +2,11 @@
 import argparse
 import json
 from pathlib import Path
+import sys
 
 ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from common.project_paths import portable_path
 
 
 def main():
@@ -23,6 +26,8 @@ def main():
             'work_dir':str(ROOT/'data/portable_rsi/worker'),'workers':2,
             'decision_schedule':{'seconds':2,'planner_seconds':20,'event_min_seconds':.5,
                 'events':['new_threat','threat_advance','plant_lost','resource_ready'],'selection':'flat'}}
+    for name in ('repository','game_executable','runtime_bin','resources','work_dir'):
+        config[name]=portable_path(config[name])
     out.parent.mkdir(parents=True,exist_ok=True)
     out.write_text(json.dumps(config,indent=2)+'\n')
     print('Wrote',out,'; SSH settings are read from local.json')

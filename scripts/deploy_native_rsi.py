@@ -11,7 +11,7 @@ parser.add_argument('--package-only',action='store_true')
 args=parser.parse_args()
 
 root = Path(__file__).resolve().parents[1]
-files = '''common/local_config.py scripts/remote_config.py common/file_lock.py rsi/native_bridge.py rsi/native_gate.py rsi/native_jobs.py
+files = '''common/local_config.py common/project_paths.py scripts/remote_config.py common/file_lock.py rsi/native_bridge.py rsi/native_gate.py rsi/native_jobs.py
 rsi/native_loop.py rsi/native_runtime.py rsi/native_player.py rsi/native_engineer.py
 rsi/native_schedule.py rsi/native_transport.py rsi/native_arena_worker.py
 rsi/code_bundle.py rsi/code_engineer.py rsi/code_store.py rsi/code_coach.py rsi/code_model.py
