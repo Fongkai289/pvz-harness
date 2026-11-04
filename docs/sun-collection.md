@@ -23,4 +23,4 @@
 - 服务器相关回归97项通过、1项 Tk 展示测试跳过；Windows 新拾取链路、模型请求、状态展示及客户端控制相关46项通过。
 - 生产健康检查返回 `planner-guidance-jev-planting-auto-suns-v3` 和 `code-two-frame-v1`；playbook 保持 v009。
 - 回放已有截图的独立会话 `20261030-161635-sun-validation-no-executor-e543f8` 收到 (226,145)、(63,230)、(166,371) 三处拾取指令，来源全部 sun_collector，Jev 调用0次。未连接鼠标执行器，不把该回放当作真实拾取成功或新的一局游戏。
-- 更新前备份：`/srv/operator/pvz-backups/before-auto-suns-20261030-161512.tgz`。
+- 更新前备份：`/srv/pvz-backups/before-auto-suns-20261030-161512.tgz`。

@@ -46,12 +46,13 @@ function Get-ServerToken {
     try {
         . (Join-Path $PSScriptRoot 'connect_server.ps1')  # dot-sourced: loads helpers, does not connect
         $bind = Get-SshBindAddress
-        $key = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..\..\..\pvz_operator')).Path
-        $sshArgs = @('-i', $key, '-p', '22', '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
+        $taskSsh=Get-PvzSshSettings -RequireRemoteDir
+        $key = (Resolve-Path -LiteralPath $taskSsh.key).Path
+        $sshArgs = @('-i', $key, '-p', [string]$taskSsh.port, '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
             '-o', 'StrictHostKeyChecking=yes', '-o', 'ConnectTimeout=15', '-o', 'LogLevel=ERROR', '-T', '-n')
         if ($bind) { $sshArgs += @('-b', $bind) }
-        $line = & ssh.exe @sshArgs 'operator@server.example.com' `
-            "sed -n 's/^PVZ_TOKEN=//p' /srv/pvz-harness/.env | tail -n 1" 2>$null
+        $line = & ssh.exe @sshArgs $taskSsh.host `
+            "sed -n 's/^PVZ_TOKEN=//p' '$($taskSsh.remote_dir)/.env' | tail -n 1" 2>$null
         if ($LASTEXITCODE -ne 0) { return '' }
         return ([string]$line).Trim().Trim('"').Trim("'")
     } catch { return '' }

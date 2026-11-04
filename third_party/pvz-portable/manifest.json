@@ -1,0 +1,17 @@
+{
+  "upstream": "https://github.com/wszqkzqk/PvZ-Portable.git",
+  "revision": "98b659380014c89c3553fbb2839f5e5a84d6df3d",
+  "patch_sha256": "f0e85f6d65bc7eeb09761c6afe911ed13db70afdc20ff6f603d8a320f9b46e15",
+  "license": "LGPL-3.0",
+  "files": {
+    "src/LawnApp.cpp": "1807d935df21f964f18a91e5cf262794482653e947a0fa7bc554305b9fe22f4a",
+    "src/LawnApp.h": "a9479ee13110405ae3ca03a36c7db434cf928112b3b71a82d82ad5b74e5a02c6",
+    "src/SexyAppFramework/Common.cpp": "43a8f2aa8bda966c07c2342ba09a53f7acd2391dc47175c5f16532bfbaca7ad3",
+    "src/SexyAppFramework/platform/default/Window.cpp": "1de22d893422af9d42eb121d17c4b017c4dee815512e83ecbc531425b6f27a25",
+    "src/main.cpp": "de6751b5be0509cc92c5799ebd2508404b9692dab81adf2470f2b0085b0c9b4a",
+    "src/Harness.cpp": "b1d820da1d12e6363d1dc39ea3103a57f5a3245491acd0e81bd5d2ffa34e644c",
+    "tools/HARNESS.md": "2174d9fc06d28d0ada09ebf30571013131a636656f2197873597eccac805c0c7",
+    "tools/build-harness.ps1": "a1ef5426bab8c5d00b4d4ed08b1749017e35b104e2fd5b85b8f8cca6ee3a0be1",
+    "tools/harness_benchmark.py": "7cd15e452df1db1ee316c48e189a915da5dbd36f375811a8c7a6651ddbaa39da"
+  }
+}

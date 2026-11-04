@@ -89,5 +89,5 @@ Portable 的环境标识是 `pvz_portable`，绑定上游、实际 EXE、补丁�
 
 部署入口 `scripts/deploy_portable.py` 会备份限定文件、上传并跑测试，不操作共享
 模型或重启真实游戏服务。最近一次初始备份为
-`/srv/operator/pvz-backups/before-portable-20261031-172455.tgz`，最终增量备份为
-`/srv/operator/pvz-backups/before-portable-20261031-173425.tgz`。
+`/srv/pvz-backups/before-portable-20261031-172455.tgz`，最终增量备份为
+`/srv/pvz-backups/before-portable-20261031-173425.tgz`。

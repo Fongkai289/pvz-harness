@@ -1,11 +1,13 @@
 """Deploy scoped research RPC support without restarting any shared service."""
 from pathlib import Path
 import subprocess
+from remote_config import ssh_settings, remote_command
 import tarfile
 import ipaddress
 
 root=Path(__file__).resolve().parents[1]
-files='''rsi/portable_runtime.py rsi/portable_bridge.py rsi/portable_loop.py
+ssh=ssh_settings()
+files='''common/local_config.py scripts/remote_config.py rsi/portable_runtime.py rsi/portable_bridge.py rsi/portable_loop.py
 rsi/native_runtime.py rsi/native_loop.py rsi/native_jobs.py rsi/native_engineer.py
 rsi/native_bridge.py rsi/native_schedule.py rsi/native_transport.py
 server/scene.py server/action_selector.py rules/hard_rules.py tests/test_portable.py
@@ -23,18 +25,18 @@ network=subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass
 network.check_returncode()
 address=network.stdout.strip()
 base=['-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ConnectTimeout=10',
-      '-i',str(root.parent.parent/'pvz_operator')]
+      '-i',ssh['key']]
 if address: base+=['-o','BindAddress='+str(ipaddress.IPv4Address(address))]
-host='operator@server.example.com'
-subprocess.run(['scp',*base,'-P','22',str(package),host+':/srv/pvz-harness/data/portable-support-upload.tgz'],check=True)
+host=ssh['host']
+subprocess.run(['scp',*base,'-P',str(ssh['port']),str(package),host+':'+ssh['remote_dir']+'/data/portable-support-upload.tgz'],check=True)
 remote=r'''
 from pathlib import Path
 from datetime import datetime
 import tarfile, subprocess, json
-root=Path('/srv/pvz-harness').resolve()
+root=Path.cwd().resolve()
 backup=root/'data'/'deploy_backups'/('before-portable-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'.tgz')
 backup.parent.mkdir(parents=True,exist_ok=True)
-with tarfile.open('/srv/pvz-harness/data/portable-support-upload.tgz') as archive:
+with tarfile.open(root/'data/portable-support-upload.tgz') as archive:
     members=archive.getmembers()
     assert all(m.isfile() and (root/m.name).resolve().is_relative_to(root) for m in members)
     with tarfile.open(backup,'w:gz') as old:
@@ -49,5 +51,5 @@ subprocess.run([str(root/'.venv/bin/python'),'-m','pytest','tests/test_portable.
     'tests/test_system0_actions.py','-q','--disable-warnings'],cwd=root,check=True)
 print('Portable RPC ready; live service not restarted',flush=True)
 '''
-subprocess.run(['ssh',*base,'-p','22',host,'cd /srv/pvz-harness && .venv/bin/python -'],
+subprocess.run(['ssh',*base,'-p',str(ssh['port']),host,remote_command(ssh,'.venv/bin/python -')],
                input=remote.encode(),check=True)

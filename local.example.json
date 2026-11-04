@@ -1,0 +1,8 @@
+{
+  "ssh": {
+    "host": "operator@server.example.com",
+    "port": 22,
+    "key": "~/.ssh/pvz_operator",
+    "remote_dir": "/srv/pvz-harness"
+  }
+}

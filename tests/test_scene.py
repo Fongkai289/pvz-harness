@@ -79,7 +79,7 @@ def test_look_plants_reads_a_code_matrix_from_the_cell_mosaic():
 
     looker = QwenLooker("http://qwen", "Qwen3.8-27B", timeout=5,
                         client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
-    image = cv2.imread(str(FIXTURES / "day_1-6_f0073.jpg"))
+    image = np.random.default_rng(42).integers(0, 256, (600, 800, 3), dtype=np.uint8)
     result = asyncio.run(looker.look_plants(image, ["sunflower", "peashooter", "potato mine"]))
     assert result.plants == {(0, 0): ["sunflower"], (1, 2): ["peashooter"], (4, 8): ["other plant"]}
     content = seen["messages"][0]["content"]
@@ -97,8 +97,9 @@ def test_classify_lawn_from_colour():
     assert [classify_lawn(i) for i in (day, night, pool)] == ["day", "night", "pool"]
 
 
-def test_resource_and_zombie_models_have_separate_requests_and_fields():
+def test_resource_and_zombie_models_have_separate_requests_and_fields(monkeypatch):
     from server.scene import QwenLooker
+    monkeypatch.setattr("server.scene.find_shovel", lambda image: None)
     seen = []
     def handler(request):
         body = json.loads(request.content)

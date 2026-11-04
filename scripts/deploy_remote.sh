@@ -11,7 +11,7 @@ if [ ! -f .env ]; then
   echo "missing $dir/.env (copy .env.example and set PVZ_TOKEN)" >&2
   exit 1
 fi
-find . -mindepth 1 -maxdepth 1 ! -name .env ! -name .venv ! -name runs ! -name logs ! -name data ! -name uv.lock \
+find . -mindepth 1 -maxdepth 1 ! -name .env ! -name local.json ! -name .venv ! -name runs ! -name logs ! -name data ! -name uv.lock \
   -exec rm -rf {} +
 tar -xzf "$tarball" --no-same-owner
 rm -f "$tarball"

@@ -1,7 +1,8 @@
 [project]
-name = "pvz-agent"
+name = "pvz-harness"
 version = "0.1.0"
 description = "Computer-use agent for Plants vs. Zombies: Windows thin client + remote server brain"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.70",

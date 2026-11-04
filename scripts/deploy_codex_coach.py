@@ -7,6 +7,7 @@ import base64
 import ipaddress
 import json
 import subprocess
+from remote_config import ssh_settings, remote_command
 
 ROOT=Path(__file__).resolve().parents[1]
 FILES=sorted({p.relative_to(ROOT).as_posix() for folder in ('rsi','server','rules','common','tests')
@@ -16,7 +17,7 @@ FILES=sorted({p.relative_to(ROOT).as_posix() for folder in ('rsi','server','rule
 REMOTE=r'''
 from pathlib import Path
 import base64,json,subprocess,tarfile,time,urllib.request,hashlib
-root=Path('/srv/pvz-harness')
+root=Path.cwd()
 assert root.resolve()==root
 health=lambda:json.load(urllib.request.urlopen('http://127.0.0.1:8765/health',timeout=5))
 initial=health(); assert initial['ok'] and not initial['sessions'],'Active game'
@@ -54,15 +55,16 @@ print(json.dumps({'health_ok':h['ok'],'coach_provider':h['coach_provider'],'coac
 '''
 
 def main():
+    ssh=ssh_settings()
     network=subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-Command',
         ". './scripts/connect_server.ps1'; Get-SshBindAddress"],cwd=ROOT,capture_output=True,text=True,
         encoding='utf-8',errors='replace',timeout=30,creationflags=subprocess.CREATE_NO_WINDOW)
     network.check_returncode()
     args=['ssh','-T','-o','BatchMode=yes','-o','StrictHostKeyChecking=yes','-o','ConnectTimeout=10',
           '-o','ServerAliveInterval=15','-o','ServerAliveCountMax=3',
-          '-i',str(ROOT.parent.parent/'pvz_operator'),'-p','22']
+          '-i',ssh['key'],'-p',str(ssh['port'])]
     if network.stdout.strip():args+=['-b',str(ipaddress.IPv4Address(network.stdout.strip()))]
-    args+=['operator@server.example.com','cd /srv/pvz-harness && .venv/bin/python -u -']
+    args+=[ssh['host'],remote_command(ssh,'.venv/bin/python -u -')]
     payload={name:base64.b64encode((ROOT/name).read_bytes().replace(b'\r\n',b'\n')).decode() for name in FILES}
     subprocess.run(args,input=('FILES='+repr(payload)+'\n'+REMOTE).encode(),check=True)
 

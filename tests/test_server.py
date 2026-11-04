@@ -13,6 +13,13 @@ from server.config import Settings
 from server.planner import MockPlanner
 
 
+@pytest.fixture(autouse=True)
+def synthetic_card_reader(monkeypatch):
+    # These tests exercise session scheduling and authority, not copyrighted card art.
+    monkeypatch.setattr("server.seed_packets.read_bank", lambda image: [])
+    monkeypatch.setattr("server.session.known_plants", lambda: ["peashooter", "sunflower", "cherry bomb"])
+
+
 @pytest.fixture
 def settings(tmp_path):
     return Settings(

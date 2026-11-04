@@ -1,4 +1,9 @@
 .env
+local.json
+*.local.json
+*.pem
+id_ed25519*
+id_rsa*
 .venv/
 __pycache__/
 .pytest_cache/
@@ -7,3 +12,11 @@ logs/
 data/
 .cache/
 .venv-sim/
+docs/screens/**/*.png
+docs/screens/**/*.jpg
+docs/screens/*.png
+docs/screens/*.jpg
+tests/fixtures/*.jpg
+tests/fixtures/*.png
+knowledge/seed_packets.npz
+knowledge/shovel_box.png

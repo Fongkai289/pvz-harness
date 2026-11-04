@@ -1,11 +1,13 @@
 # 环境验证记录（Windows 游戏机）
 
+> 历史测量记录，非当前部署指南。截图保留在私有工作区；公开复现见 [reproduce.md](reproduce.md)。
+
 对应 `docs/HANDOFF_windows.md` 第 4 节。本文保留早期环境测量；当前运行方式见交接文档和 README。
 
 **2026-10-29 起，开发全部转到 Windows**：客户端、服务器端代码（`server/`、`rules/`、`rsi/`、`tests/`）和部署都由 Windows 这边负责，交接文档里"Mac 负责服务器"的分工不再适用。
 接管前比对过：本地代码是服务器代码的超集（服务器上只少了 `pyproject.toml` 里的 pymem 一行），并把服务器上的 `uv.lock` 拉回了本地。
 Windows 使用 `scripts/deploy.ps1`；旧 Mac 部署脚本已删除。
-模拟器代码学习另用 `scripts/start_learning.ps1`，目标为独立的 `/srv/operator/pvz-learning`。
+模拟器代码学习另用 `scripts/start_learning.ps1`，目标为独立的 `/srv/pvz-learning`。
 
 同一天的清理：
 - 服务器 `/srv/operator`：删掉了 Mac 会话留下的 13 个一次性实验脚本、3 张图片、`pvz_shots/`、缓存，以及 `runs/` 里昨天 95 局假游戏评测记录（只留了今天那局真游戏）。
@@ -151,7 +153,7 @@ Windows 使用 `scripts/deploy.ps1`；旧 Mac 部署脚本已删除。
 **结果：通过**（2026-10-29，会话 `20261029-100233-windows-11bc45`，1-6，120 秒，策略本 v004；
 服务器配置：planner 用 Qwen3.8-27B，split 模式会发图；Jev 用 OneJev-27B）
 
-- SSH：密钥放在用户桌面 `Computer Use\pvz_operator`（只有本人、SYSTEM、Administrators 能访问，OpenSSH 接受）。隧道 `ssh -N -L 8765:127.0.0.1:8765 ...` 一直开着。
+- SSH：密钥放在用户桌面 `Computer Use\<private-key-file>`（只有本人、SYSTEM、Administrators 能访问，OpenSSH 接受）。隧道 `ssh -N -L 8765:127.0.0.1:8765 ...` 一直开着。
 - 令牌：从服务器 `.env` 读进当前进程的环境变量，客户端从 `$env:PVZ_TOKEN` 取，不出现在命令行、文件或聊天里。
   注意：Windows 自带的 ssh 放在 PowerShell 管道里时会卡住（在等标准输入），要加 `-n -o BatchMode=yes`。
 - 118 条命令全部执行成功。从截图到点击的延迟：**中位数 286 ms，p95 346 ms，最大 379 ms**。

@@ -4,5 +4,10 @@
 *.md text eol=lf
 *.json text eol=lf
 *.toml text eol=lf
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+# Preserve the exact upstream patch bytes and license text.
+third_party/** -whitespace
+third_party/pvz-portable/harness.patch -text
 *.png binary
 *.jpg binary

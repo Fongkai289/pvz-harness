@@ -2,12 +2,14 @@
 
 English | [简体中文](README.zh-CN.md)
 
+[Reproduce the setup](docs/reproduce.md) · [Game assets](docs/assets.md) · [MIT](LICENSE) · [Third-party notices](THIRD_PARTY_NOTICES.md)
+
 An agent that plays **Plants vs. Zombies** (PC, GOTY 1.2.0.1096) from screenshots, with general-purpose
 models instead of a trained game AI, and improves between games by editing its own strategy and
 player code, never model weights.
 
-The game machine (Windows) is a thin client: it streams screenshots and executes clicks. Everything
-else runs on a remote GPU server: vision, planning, action choice, the judge, logs and learning.
+The game machine (Windows) is a thin client: it streams screenshots and executes clicks. Vision, planning, action choice and judging run on the configured Linux server. The optional
+Codex Coach worker runs on Windows; research evaluation coordinates both machines.
 
 **Status (2026-11-04).** The live pipeline plays real games end to end, including choosing seeds,
 collecting sun and digging with the shovel. Training on the Portable re-implementation has won
@@ -50,10 +52,12 @@ These are enforced by code and tests, not by convention.
 - **Fixed rules.** Hard rules (`rules/hard_rules.py`), playbook ranges and promotion gates cannot be
   changed by the Coach.
 - **Traceable versions.** Playbooks and player code are immutable versions; every change is logged.
-- **Shared model pools.** The Windows machine never calls the models directly, and Jev never
-  receives images.
+- **Shared model pools.** Live gameplay model calls go through the server; the optional Windows
+  Codex Coach uses its own worker. Jev receives text only.
 
 ## Repository layout
+
+The local workspace contains this `app/` repository and a sibling `external/` dependency directory. See the [workspace layout and entry points](docs/workspace-layout.md).
 
 | Path | Contents |
 |---|---|
@@ -64,7 +68,7 @@ These are enforced by code and tests, not by convention.
 | `common/` | Wire protocol shared by client and server |
 | `knowledge/` | Strategy notes, static game reference, card and shovel templates |
 | `scripts/` | Launchers, deployment, control center server, training tools |
-| `tests/` | ~720 tests; run them all before deploying |
+| `tests/` | Offline CI plus optional Windows/native/artwork checks |
 | `docs/` | Architecture, project status, operations (see below) |
 
 ## Getting started
@@ -89,7 +93,7 @@ These are enforced by code and tests, not by convention.
    - **Client controls:** *开始 / 暂停 / 继续 / 结束* control the client only; game menus stay manual.
    - **游戏进度:** *选植物* fills the seed bank on the chooser screen; you press "Let's Rock".
    - **赛后复盘:** reviews of recent games, with each game's result.
-4. For post-game reviews, start the Codex Coach worker: `scripts/codex_coach.ps1 -Mode Start`.
+4. For the optional Codex Coach backend, start the Windows worker: `scripts/codex_coach.ps1 -Mode Start`.
 
 ### Training
 

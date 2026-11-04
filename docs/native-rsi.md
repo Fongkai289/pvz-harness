@@ -76,7 +76,7 @@ Watch 消费自动队列，Run 消费已有任务直到本轮结束。`-Mode Run
 
 控制台“复盘”页显示 `/learning/latest` 的任务状态、基线、候选和阻塞原因。服务端 `data/native_rsi/<session>/` 保存任务、候选提案和各阶段报告；Windows 配置的 work_dir 保存进度和单局检查点。晋升只在下一次真实客户端连接生效，正在进行的对局固定原策略。
 
-离线自动测试覆盖排队、Coach/Engineer 分工、Windows 测试回传、精确代码版本提交、子进程真实执行、权限/资源限制、真实会话加载、全阶段晋升、截图退化拒绝、错误证据拒绝、暂停、断点恢复与上游Gym接口。测试夹具明确不能作为线上成绩。当前缺兼容游戏，尚无本闭环真实对局成绩，也未证明 state 优于截图或 RSI 带来提升。2026-10-31 新代码已部署到 /srv/pvz-harness，native_evolution=code、automatic_native_rsi=true；已核对41个文件与更新包一致。备份：/srv/operator/pvz-backups/before-native-rsi-20261031-144626.tgz。
+离线自动测试覆盖排队、Coach/Engineer 分工、Windows 测试回传、精确代码版本提交、子进程真实执行、权限/资源限制、真实会话加载、全阶段晋升、截图退化拒绝、错误证据拒绝、暂停、断点恢复与上游Gym接口。测试夹具明确不能作为线上成绩。当前缺兼容游戏，尚无本闭环真实对局成绩，也未证明 state 优于截图或 RSI 带来提升。2026-10-31 新代码已部署到 /srv/pvz-harness，native_evolution=code、automatic_native_rsi=true；已核对41个文件与更新包一致。备份：/srv/pvz-backups/before-native-rsi-20261031-144626.tgz。
 
 ## 1.2.0.1065 获取线索
 

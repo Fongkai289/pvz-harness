@@ -7,8 +7,8 @@ Tunnel mode may reconnect because it runs no remote application command.
 [CmdletBinding()]
 param(
     [ValidateSet('Shell', 'Probe', 'Command', 'Tunnel')][string]$Mode = 'Shell',
-    [string]$SshHost = 'operator@server.example.com',
-    [ValidateRange(1,65535)][int]$Port = 22,
+    [string]$SshHost = '',
+    [ValidateRange(0,65535)][int]$Port = 0,
     [string]$Key = '',
     [string]$InterfaceAlias = '',
     [switch]$UseDefaultRoute,
@@ -32,6 +32,7 @@ $script:ConnectionScriptRoot = $PSScriptRoot
 if (-not $script:ConnectionScriptRoot) {
     $script:ConnectionScriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 }
+. (Join-Path $script:ConnectionScriptRoot 'local_config.ps1')
 
 function Get-SshOutcome {
     param([int]$ExitCode, [string]$DebugText, [string]$ConnectionMode)
@@ -136,7 +137,8 @@ function ConvertTo-NativeCommandLine {
 
 function Invoke-StableSsh {
     $script:ConnectionExitCode = 1
-    if (-not $Key) { $Key = Join-Path $script:ConnectionScriptRoot '..\..\..\pvz_operator' }
+    $taskSsh = Get-PvzSshSettings -SshHost $SshHost -Port $Port -Key $Key
+    $SshHost=$taskSsh.host; $Port=$taskSsh.port; $Key=$taskSsh.key
     if (-not $LogDirectory) { $LogDirectory = Join-Path $script:ConnectionScriptRoot '..\logs\ssh' }
     if ($SshHost -notmatch '^[A-Za-z0-9_\[][A-Za-z0-9_.@:\[\]-]*$') {
         throw 'SshHost must be a single SSH destination, such as operator@server.example.com.'

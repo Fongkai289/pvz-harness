@@ -72,6 +72,7 @@ def test_plant_cadence_includes_inference_time_without_overlap(session, monkeypa
     session.settings = replace(session.settings, plants_interval=4)
     session.looker = SimpleNamespace()
     session.latest_jpeg = b"fixture"
+    session.card_memory.names = ["sunflower"]  # Timing test: card recognition is already complete.
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(session.plants_loop())
     assert starts == expected
@@ -91,6 +92,7 @@ def test_skipped_look_runs_when_the_next_frame_lands_not_at_the_next_tick(sessio
     session.settings = replace(session.settings, plants_interval=0.4)
     session.looker = SimpleNamespace()
     session.latest_jpeg = b"fixture"
+    session.card_memory.names = ["sunflower"]
     async def scenario():
         loop = asyncio.get_running_loop()
         task = asyncio.create_task(session.plants_loop())

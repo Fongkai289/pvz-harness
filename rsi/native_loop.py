@@ -16,6 +16,7 @@ from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 from common.file_lock import file_lock
+from common.local_config import ssh_settings, remote_command
 from rsi.code_store import write_json
 from rsi.native_gate import episode_score, SCORE_VERSION
 from rsi.native_jobs import digest, TERMINAL, source_digest
@@ -44,7 +45,7 @@ HEARTBEAT_S = 30  # well inside the server bridge's IDLE_EXIT_S
 
 class SSHBridge:
     def __init__(self, config, root):
-        ssh = config["ssh"]
+        ssh = ssh_settings(config.get("ssh"))
         args = ["ssh", "-T", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes",
                 "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3",
                 "-i", ssh["key"], "-p", str(ssh["port"])]
@@ -63,7 +64,7 @@ class SSHBridge:
             args += ["-b", address]
         module = {'pvz_portable': 'rsi.portable_bridge', 'codex_coach': 'rsi.codex_queue'}.get(
             config.get('backend'), 'rsi.native_bridge')
-        args += [ssh["host"], "cd /srv/pvz-harness && .venv/bin/python -u -m "+module]
+        args += [ssh["host"], remote_command(ssh, ".venv/bin/python -u -m "+module)]
         self.log = (root / "ssh.log").open("a", encoding="utf-8")
         self.process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
                                         text=True, encoding="utf-8", creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

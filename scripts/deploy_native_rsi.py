@@ -1,6 +1,7 @@
 """Back up and deploy only native-RSI files; no shared model service changes."""
 from pathlib import Path
 import subprocess
+from remote_config import ssh_settings, remote_command
 import tarfile
 import argparse
 import ipaddress
@@ -10,7 +11,7 @@ parser.add_argument('--package-only',action='store_true')
 args=parser.parse_args()
 
 root = Path(__file__).resolve().parents[1]
-files = '''common/file_lock.py rsi/native_bridge.py rsi/native_gate.py rsi/native_jobs.py
+files = '''common/local_config.py scripts/remote_config.py common/file_lock.py rsi/native_bridge.py rsi/native_gate.py rsi/native_jobs.py
 rsi/native_loop.py rsi/native_runtime.py rsi/native_player.py rsi/native_engineer.py
 rsi/native_schedule.py rsi/native_transport.py rsi/native_arena_worker.py
 rsi/code_bundle.py rsi/code_engineer.py rsi/code_store.py rsi/code_coach.py rsi/code_model.py
@@ -34,8 +35,9 @@ with tarfile.open(package, 'w:gz') as archive:
 print('PACKAGE='+str(package),flush=True)
 if args.package_only:
     raise SystemExit(0)
-key = str(root.parent.parent / 'pvz_operator')
-host = 'operator@server.example.com'
+ssh = ssh_settings()
+key = ssh['key']
+host = ssh['host']
 base = ['-o', 'BatchMode=yes', '-o', 'ConnectTimeout=8', '-o', 'StrictHostKeyChecking=yes', '-i', key]
 network=subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass','-Command',
                        ". './scripts/connect_server.ps1'; Get-SshBindAddress"],cwd=root,capture_output=True,
@@ -43,16 +45,16 @@ network=subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass
 if network.returncode: raise RuntimeError('Could not determine Wi-Fi address')
 address=network.stdout.strip()
 bind=['-o','BindAddress='+str(ipaddress.IPv4Address(address))] if address else []
-subprocess.run(['scp', *base, *bind, '-P', '22',
-                str(package), host + ':/srv/pvz-harness/data/native-rsi-upload.tgz'], check=True)
+subprocess.run(['scp', *base, *bind, '-P', str(ssh['port']),
+                str(package), host + ':' + ssh['remote_dir'] + '/data/native-rsi-upload.tgz'], check=True)
 remote = r'''
 from pathlib import Path
 from datetime import datetime
 import json, tarfile, subprocess, urllib.request
-root = Path('/srv/pvz-harness').resolve()
+root = Path.cwd().resolve()
 health = json.load(urllib.request.urlopen('http://127.0.0.1:8765/health'))
 assert not health['sessions'], 'Active sessions: refuse restart during play'
-with tarfile.open('/srv/pvz-harness/data/native-rsi-upload.tgz') as archive:
+with tarfile.open(root/'data/native-rsi-upload.tgz') as archive:
     members = archive.getmembers()
     assert all(m.isfile() and (root/m.name).resolve().is_relative_to(root) for m in members)
     backup = root/'data'/'deploy_backups'/('before-native-rsi-'+datetime.now().strftime('%Y%m%d-%H%M%S')+'.tgz')
@@ -74,6 +76,6 @@ subprocess.run(['tmux','kill-session','-t','pvz'],check=True)
 subprocess.run(['tmux','new-session','-d','-s','pvz','-c',str(root),'bash scripts/run_server.sh'],check=True)
 print('RESTARTED=pvz',flush=True)
 '''
-subprocess.run(['ssh', *base, *bind, '-p', '22', host,
-                'cd /srv/pvz-harness && .venv/bin/python -'],
+subprocess.run(['ssh', *base, *bind, '-p', str(ssh['port']), host,
+                remote_command(ssh, '.venv/bin/python -')],
                input=remote.encode('utf-8'), check=True)

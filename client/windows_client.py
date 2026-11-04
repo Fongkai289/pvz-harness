@@ -1,7 +1,7 @@
 """Real client for the Windows game machine (checked in docs/env.md, items 1-3 and 8).
 
     pip install -e ".[client]"   (or: uv sync --extra client)
-    ssh -N -L 8765:127.0.0.1:8765 -p 22 -i <key> root@<server>    # tunnel, keep open
+    ssh -N -L 8765:127.0.0.1:8765 -p <port> -i <key> <user>@<server>    # tunnel, keep open
     python -m client.windows_client                   # token: --token or $env:PVZ_TOKEN
 
 Captures the game client area and executes Jev-authorized gameplay clicks only.

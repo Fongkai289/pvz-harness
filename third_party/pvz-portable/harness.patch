@@ -1,0 +1,719 @@
+diff --git a/src/LawnApp.cpp b/src/LawnApp.cpp
+index 48ee9ff..1f75fd9 100644
+--- a/src/LawnApp.cpp
++++ b/src/LawnApp.cpp
+@@ -1954,6 +1954,8 @@ void LawnApp::CenterDialog(Dialog* theDialog, int theWidth, int theHeight)
+ 
+ void LawnApp::PlayFoley(FoleyType theFoleyType)
+ {
++	// Audio completion uses wall time and otherwise perturbs the shared RNG.
++	if (std::getenv("PVZ_HARNESS")) return;
+ 	if (!mMuteSoundsForCutscene)
+ 	{
+ 		mSoundSystem->PlayFoley(theFoleyType);
+@@ -1962,6 +1964,7 @@ void LawnApp::PlayFoley(FoleyType theFoleyType)
+ 
+ void LawnApp::PlayFoleyPitch(FoleyType theFoleyType, float thePitch)
+ {
++	if (std::getenv("PVZ_HARNESS")) return;
+ 	if (!mMuteSoundsForCutscene)
+ 	{
+ 		mSoundSystem->PlayFoleyPitch(theFoleyType, thePitch);
+diff --git a/src/LawnApp.h b/src/LawnApp.h
+index 80ba516..88d017f 100644
+--- a/src/LawnApp.h
++++ b/src/LawnApp.h
+@@ -72,6 +72,8 @@ public:
+ class LawnApp : public SexyApp
+ {
+ public:
++	// Experimental owned-process adapter must flush deferred board deletion on reset.
++	using SexyApp::ProcessSafeDeleteList;
+ 	Board*							mBoard;
+ 	std::unique_ptr<TitleScreen>	mTitleScreen;
+ 	std::unique_ptr<GameSelector>	mGameSelector;
+diff --git a/src/SexyAppFramework/Common.cpp b/src/SexyAppFramework/Common.cpp
+index 284af92..176a8b1 100644
+--- a/src/SexyAppFramework/Common.cpp
++++ b/src/SexyAppFramework/Common.cpp
+@@ -114,6 +114,12 @@ void Sexy::SRand(ulong theSeed)
+ 	gMTRand.SRand(theSeed);
+ }
+ 
++// Research screenshots are observations, not gameplay RNG events.
++namespace Sexy {
++std::string HarnessSaveRand() { return gMTRand.Serialize(); }
++void HarnessRestoreRand(const std::string& state) { gMTRand.SRand(state); }
++}
++
+ std::string Sexy::GetAppDataFolder()
+ {
+ 	return PathToU8(Sexy::gAppDataFolder);
+diff --git a/src/SexyAppFramework/platform/default/Window.cpp b/src/SexyAppFramework/platform/default/Window.cpp
+index 737bd98..fceeb1a 100644
+--- a/src/SexyAppFramework/platform/default/Window.cpp
++++ b/src/SexyAppFramework/platform/default/Window.cpp
+@@ -23,6 +23,7 @@
+  */
+ 
+ #include <SDL.h>
++#include <cstdlib>
+ 
+ #include <memory>
+ #include <type_traits>
+@@ -58,6 +59,8 @@ void SexyAppBase::MakeWindow()
+ 
+ 		Uint32 winFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE
+ 			| (!mIsWindowed ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
++		if (std::getenv("PVZ_HARNESS"))
++			winFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_HIDDEN;
+ 
+ 		using WindowPtr = std::unique_ptr<SDL_Window, decltype(&SDL_DestroyWindow)>;
+ 		using GLContextPtr = std::unique_ptr<std::remove_pointer_t<SDL_GLContext>, decltype(&SDL_GL_DeleteContext)>;
+diff --git a/src/main.cpp b/src/main.cpp
+index 4c2b228..2b0c13e 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -26,6 +26,8 @@
+ #include <vector>
+ using namespace Sexy;
+ 
++int RunHarness(LawnApp& app);
++
+ #ifdef _WIN32
+ #include <windows.h>
+ #include <shellapi.h>
+@@ -97,11 +99,15 @@ int main(int argc, char** argv)
+ 	gLawnApp = new LawnApp();
+ 	gLawnApp->SetArgs(argc, argv);
+ 	gLawnApp->Init();
+-	gLawnApp->Start();
++	int result = 0;
++	if (std::getenv("PVZ_HARNESS"))
++		result = RunHarness(*gLawnApp);
++	else
++		gLawnApp->Start();
+ #ifndef __EMSCRIPTEN__
+ 	gLawnApp->Shutdown();
+ 	delete gLawnApp;
+ #endif
+ 
+-	return 0;
++	return result;
+ };
+diff --git a/src/Harness.cpp b/src/Harness.cpp
+new file mode 100644
+index 0000000..2fcc939
+--- /dev/null
++++ b/src/Harness.cpp
+@@ -0,0 +1,305 @@
++// Local experimental adapter. SPDX-License-Identifier: LGPL-3.0-or-later
++// Never opens a network port or drives the desktop. Only an owned stdin pipe.
++#include "LawnApp.h"
++#include "Lawn/Board.h"
++#include "Lawn/Cutscene.h"
++#include "Lawn/SeedPacket.h"
++#include "Lawn/System/PlayerInfo.h"
++#include "Lawn/System/ProfileMgr.h"
++#include "Lawn/System/Music.h"
++#include "Lawn/Widget/SeedChooserScreen.h"
++#include "SexyAppFramework/graphics/MemoryImage.h"
++#include "SexyAppFramework/graphics/Graphics.h"
++#include "PvzpLib/EffectSystem.h"
++#include "SexyAppFramework/Common.h"
++#include <SDL.h>
++#include <algorithm>
++#include <array>
++#include <cstdlib>
++#include <iostream>
++#include <fstream>
++#include <filesystem>
++#include <sstream>
++#include <stdexcept>
++#include <vector>
++
++namespace Sexy {
++std::string HarnessSaveRand();
++void HarnessRestoreRand(const std::string& state);
++}
++
++namespace {
++std::array<int, 6> mowerTicks;
++int startTick = 0;
++bool Done(LawnApp& a) {
++    return a.mBoard && (a.mBoardResult == BOARDRESULT_LOST || a.mBoard->mLevelAwardSpawned || a.mBoard->mLevelComplete);
++}
++void Tick(LawnApp& a) {
++    a.mBoard->ProcessDeleteQueue();
++    a.mEffectSystem->ProcessDeleteQueue();
++    ++a.mAppCounter;
++    ++a.mUpdateCount;
++    a.mBoard->Update();
++    // Native automatic sun collection, independent of planting decisions.
++    for (auto* c : a.mBoard->mCoins)
++        if (!c->mDead && c->IsSun() && !c->mIsBeingCollected) c->Collect();
++    for (auto* m : a.mBoard->mLawnMowers)
++        if (m->mMowerState == MOWER_TRIGGERED && m->mRow >= 0 && m->mRow < 6 && mowerTicks[m->mRow] < 0)
++            mowerTicks[m->mRow] = a.mBoard->mMainCounter - startTick;
++}
++void Snapshot(LawnApp& a) {
++    auto& b = *a.mBoard;
++    std::ostringstream o;
++    o << std::boolalpha;
++    o << "{\"ok\":true,\"level\":" << b.mLevel << ",\"tick\":" << b.mMainCounter-startTick
++      << ",\"sun\":" << b.mSunMoney << ",\"wave\":" << b.mCurrentWave << ",\"waves\":" << b.mNumWaves
++      << ",\"conveyor\":" << b.HasConveyorBeltSeedBank() << ",\"shovel\":" << (b.mShowShovel && !Done(a))
++      << ",\"terminal\":" << Done(a) << ",\"outcome\":\""
++      << (a.mBoardResult == BOARDRESULT_LOST ? "lose" : Done(a) ? "win" : "running") << "\",\"plants\":[";
++    bool comma = false;
++    for (auto* p : b.mPlants) if (!p->mDead) {
++        if (comma) o << ','; comma = true;
++        o << "{\"type\":" << p->mSeedType << ",\"row\":" << p->mRow << ",\"col\":" << p->mPlantCol << '}';
++    }
++    o << "],\"zombies\":["; comma = false;
++    for (auto* z : b.mZombies) if (!z->mDead) {
++        if (comma) o << ','; comma = true;
++        o << "{\"type\":" << z->mZombieType << ",\"row\":" << z->mRow << ",\"x\":" << z->mPosX
++          << ",\"phase\":" << z->mZombiePhase << '}';
++    }
++    o << "],\"cards\":[";
++    for (int i=0; i<b.mSeedBank->mNumPackets; ++i) {
++        auto& c = b.mSeedBank->mSeedPackets[i];
++        if (i) o << ',';
++        o << "{\"slot\":" << i << ",\"type\":" << c.mPacketType << ",\"ready\":" << (c.mActive && c.mPacketType!=SEED_NONE)
++          << ",\"cost\":" << (b.HasConveyorBeltSeedBank() ? 0 : b.GetCurrentPlantCost(c.mPacketType,c.mImitaterType)) << '}';
++    }
++    o << "],\"mower_ticks\":[";
++    for (int i=0; i<6; ++i) { if (i) o << ','; o << mowerTicks[i]; }
++    o << "],\"allowed\":["; comma = false;
++    if (!Done(a)) for (int s=0; s<b.mSeedBank->mNumPackets; ++s) {
++        auto& c = b.mSeedBank->mSeedPackets[s];
++        if (!c.CanPickUp()) continue;
++        for (int r=0; r<5; ++r) for (int col=0; col<9; ++col)
++            if (b.CanPlantAt(col,r,c.mPacketType)==PLANTING_OK) {
++                if (comma) o << ','; comma = true;
++                o << '[' << s << ',' << r << ',' << col << ']';
++            }
++    }
++    o << "]}";
++    std::cout << "PVZRPC " << o.str() << std::endl;
++}
++unsigned pendingSeed = 0;  // between "prepare" (stopped at the seed chooser) and "choose"
++bool atChooser = false;
++void BeginReset(LawnApp& a, int level, unsigned seed) {
++    // First area only; do not silently skip unsupported night/pool/roof rules.
++    if (level < 1 || level > 10) throw std::runtime_error("unsupported_level");
++    atChooser = false;
++    std::cerr << "harness reset: deleting previous board" << std::endl;
++    a.KillBoard();
++    a.ProcessSafeDeleteList();
++    a.mEffectSystem->ProcessDeleteQueue();
++    a.mPlayerInfo->mLevel = level;
++    a.mPlayerInfo->mFinishedAdventure = 0;
++    a.mAppRandSeed = seed;
++    a.mAppCounter = 0;
++    a.mUpdateCount = 0;
++    a.mBoardResult = BOARDRESULT_NONE;
++    Sexy::SRand(seed);
++    std::srand(seed);
++    mowerTicks.fill(-1);
++    startTick = 0;
++    std::cerr << "harness reset: creating board" << std::endl;
++    if (a.mTitleScreen) a.FastLoad(GAMEMODE_ADVENTURE);
++    else a.PreNewGame(GAMEMODE_ADVENTURE,false);
++    a.ProcessSafeDeleteList();
++    std::cerr << "harness reset: skipping intro" << std::endl;
++    a.mBoard->mCutScene->CancelIntro();
++    pendingSeed = seed;
++    atChooser = a.mBoard->ChooseSeedsOnCurrentLevel();
++}
++std::vector<int> ChooserOffer(LawnApp& a) {
++    std::vector<int> types;
++    for (int type=0; type<SEED_IMITATER; ++type)
++        if (a.HasSeedType(static_cast<SeedType>(type))) types.push_back(type);
++    return types;
++}
++void PickSeeds(LawnApp& a, const std::vector<int>& types, int expected) {
++    // The game's own chooser clicks, then the level starts as after "Let's Rock".
++    auto& chooser = *a.mSeedChooserScreen;
++    for (int type : types) {
++        auto& seedCard = chooser.mChosenSeeds[type];
++        chooser.ClickedSeedInChooser(seedCard);
++        chooser.LandFlyingSeed(seedCard);
++    }
++    if (chooser.mSeedsInBank != expected) throw std::runtime_error("unsupported_loadout");
++    chooser.CloseSeedChooser();
++    a.mBoard->mCutScene->CancelIntro();
++    atChooser = false;
++}
++void ChooseSeeds(LawnApp& a, const std::vector<int>& types) {
++    if (!atChooser) throw std::runtime_error("not_at_seed_chooser");
++    auto offer = ChooserOffer(a);
++    size_t need = std::min<size_t>(a.mBoard->mSeedBank->mNumPackets, offer.size());
++    std::vector<int> seen;
++    for (int type : types) {
++        if (std::find(offer.begin(), offer.end(), type) == offer.end() || std::find(seen.begin(), seen.end(), type) != seen.end())
++            throw std::runtime_error("invalid_loadout");
++        seen.push_back(type);
++    }
++    if (types.size() != need) throw std::runtime_error("invalid_loadout");
++    PickSeeds(a, types, static_cast<int>(need));
++}
++void ChooserSnapshot(LawnApp& a) {
++    // Only what the chooser screen shows: the offer, the free slots and the previewed zombie types
++    // (CutScene::PlaceStreetZombies: every type in the wave list except the flag zombie), never counts or waves.
++    auto& b = *a.mBoard;
++    std::vector<int> preview;
++    for (int wave=0; wave<b.mNumWaves; ++wave)
++        for (int i=0; i<MAX_ZOMBIES_IN_WAVE; ++i) {
++            ZombieType type = b.mZombiesInWave[wave][i];
++            if (type == ZOMBIE_INVALID) break;
++            if (type != ZOMBIE_FLAG && std::find(preview.begin(), preview.end(), type) == preview.end())
++                preview.push_back(type);
++        }
++    std::sort(preview.begin(), preview.end());
++    std::ostringstream o;
++    o << "{\"ok\":true,\"chooser\":true,\"level\":" << b.mLevel << ",\"slots\":" << b.mSeedBank->mNumPackets
++      << ",\"available\":[";
++    auto offer = ChooserOffer(a);
++    for (size_t i=0; i<offer.size(); ++i) o << (i ? "," : "") << offer[i];
++    o << "],\"preview\":[";
++    for (size_t i=0; i<preview.size(); ++i) o << (i ? "," : "") << preview[i];
++    o << "]}";
++    std::cout << "PVZRPC " << o.str() << std::endl;
++}
++void FinishReset(LawnApp& a) {
++    unsigned seed = pendingSeed;
++    for (int i=0; a.mGameScene!=SCENE_PLAYING && i<3000; ++i) Tick(a);
++    if (a.mGameScene!=SCENE_PLAYING) throw std::runtime_error("intro_did_not_finish");
++    std::cerr << "harness reset: playing" << std::endl;
++    startTick = a.mBoard->mMainCounter;
++    mowerTicks.fill(-1);
++    // Resource cache warming must not change the battle's RNG stream.
++    Sexy::SRand(seed ^ 0x6d2b79f5U);
++    std::srand(seed ^ 0x6d2b79f5U);
++}
++void Reset(LawnApp& a, int level, unsigned seed) {
++    BeginReset(a, level, seed);
++    if (atChooser) {
++        // Fixed public starter loadout, no planting decisions. Same for both arms.
++        std::vector<int> types;
++        for (int type=0; type<8 && static_cast<int>(types.size())<a.mBoard->mSeedBank->mNumPackets; ++type)
++            if (a.HasSeedType(static_cast<SeedType>(type))) types.push_back(type);
++        PickSeeds(a, types, a.mBoard->mSeedBank->mNumPackets);
++    }
++    FinishReset(a);
++}
++void Render(LawnApp& a) {
++    struct RestoreRand {
++        std::string state = Sexy::HarnessSaveRand();
++        ~RestoreRand() { Sexy::HarnessRestoreRand(state); }
++    } restore;
++    Sexy::MemoryImage frame(&a);
++    frame.Create(800,600);
++    Sexy::Graphics graphics(&frame);
++    a.mBoard->Draw(&graphics);
++    auto path = std::filesystem::path(a.mCustomSaveDir) / "observation.ppm";
++    std::ofstream out(path, std::ios::binary);
++    out << "P6\n800 600\n255\n";
++    const auto* bits = frame.GetBits();
++    for (int i=0; i<800*600; ++i) {
++        char rgb[3] = {static_cast<char>(bits[i]>>16),static_cast<char>(bits[i]>>8),static_cast<char>(bits[i])};
++        out.write(rgb,3);
++    }
++    if (!out) throw std::runtime_error("frame_write_failed");
++}
++void Place(LawnApp& a,int slot,int row,int col) {
++    auto& b = *a.mBoard;
++    if (slot==-1) return;
++    if (slot<0 || slot>=b.mSeedBank->mNumPackets || row<0 || row>=5 || col<0 || col>=9)
++        throw std::runtime_error("invalid_action_bounds");
++    auto& card = b.mSeedBank->mSeedPackets[slot];
++    if (!card.CanPickUp() || b.CanPlantAt(col,row,card.mPacketType)!=PLANTING_OK)
++        throw std::runtime_error("illegal_action");
++    // Use game's ordinary click handlers, including cost/cooldown accounting.
++    card.MouseDown(0,0,1);
++    b.MouseDown(b.GridToPixelX(col,row)+40,b.GridToPixelY(col,row)+40,1);
++    bool found=false;
++    for (auto* p:b.mPlants) if (!p->mDead && p->mRow==row && p->mPlantCol==col) found=true;
++    if (!found) throw std::runtime_error("game_rejected_action");
++}
++void Dig(LawnApp& a,int row,int col) {
++    auto& b = *a.mBoard;
++    if (row<0 || row>=5 || col<0 || col>=9) throw std::runtime_error("invalid_action_bounds");
++    if (!b.mShowShovel || Done(a)) throw std::runtime_error("shovel_unavailable");
++    // The player's own sequence: pick up the shovel, click the cell; the game picks the plant it digs.
++    int x=b.GridToPixelX(col,row)+40, y=b.GridToPixelY(col,row)+40;
++    b.PickUpTool(OBJECT_TYPE_SHOVEL);
++    Plant* target=b.ToolHitTest(x,y);
++    if (!target || target->mRow!=row || target->mPlantCol!=col) {
++        b.ClearCursor();
++        throw std::runtime_error("illegal_action");
++    }
++    b.MouseDownWithTool(x,y,1,CURSOR_TYPE_SHOVEL);
++    if (!target->mDead) throw std::runtime_error("game_rejected_action");
++}
++}
++
++int RunHarness(LawnApp& a) {
++    if (a.mShutdown || a.mLoadingFailed || a.mCustomSaveDir.empty()) return 2;
++    a.mActive = true;
++    if (!a.mPlayerInfo) a.mPlayerInfo = a.mProfileMgr->AddProfile("Harness");
++    // Normally TitleScreen::Update does this before StartLoadingThread.
++    a.mMusic->MusicTitleScreenInit();
++    a.LoadingThreadProc();
++    if (a.mLoadingFailed || a.mShutdown) return 3;
++    a.mLoadingThreadCompleted = true;
++    a.mLoaded = true;
++    std::cout << "PVZRPC {\"ok\":true,\"ready\":true,\"protocol\":1}" << std::endl;
++    std::string line;
++    while (std::getline(std::cin,line)) {
++        if (line.size()>4096) return 4;
++        std::istringstream in(line);
++        std::string op; in >> op;
++        try {
++            if (op=="quit") break;
++            if (op=="reset") {
++                int level; unsigned seed;
++                if (!(in>>level>>seed)) throw std::runtime_error("invalid_reset");
++                Reset(a,level,seed);
++            } else if (op=="prepare") {
++                // Like reset, but stop at the seed chooser (when the level has one) and show the offer.
++                int level; unsigned seed;
++                if (!(in>>level>>seed)) throw std::runtime_error("invalid_reset");
++                BeginReset(a,level,seed);
++                if (atChooser) { ChooserSnapshot(a); continue; }
++                FinishReset(a);
++            } else if (op=="choose" && a.mBoard) {
++                std::vector<int> types; int type;
++                while (in>>type) types.push_back(type);
++                if (!in.eof()) throw std::runtime_error("invalid_loadout");
++                ChooseSeeds(a,types);
++                FinishReset(a);
++            } else if (op=="step" && a.mBoard) {
++                int ticks,slot,row,col;
++                if (!(in>>ticks>>slot>>row>>col) || ticks<1 || ticks>1000 || Done(a))
++                    throw std::runtime_error("invalid_step");
++                Place(a,slot,row,col);
++                for (int i=0;i<ticks && !Done(a);++i) Tick(a);
++                SDL_PumpEvents();
++            } else if (op=="dig" && a.mBoard) {
++                int row,col;
++                if (!(in>>row>>col)) throw std::runtime_error("invalid_dig");
++                Dig(a,row,col);
++            } else if (op=="render" && a.mBoard) {
++                Render(a);
++            } else if (op!="state" || !a.mBoard) throw std::runtime_error("invalid_operation");
++            Snapshot(a);
++        } catch (const std::exception& e) {
++            std::cout << "PVZRPC {\"ok\":false,\"error\":\"" << e.what() << "\"}" << std::endl;
++        }
++    }
++    a.KillBoard(); a.ProcessSafeDeleteList();
++    return 0;
++}
+diff --git a/tools/HARNESS.md b/tools/HARNESS.md
+new file mode 100644
+index 0000000..bad2b85
+--- /dev/null
++++ b/tools/HARNESS.md
+@@ -0,0 +1,110 @@
++# Portable engine experiment
++
++Base: https://github.com/wszqkzqk/PvZ-Portable at
++`98b659380014c89c3553fbb2839f5e5a84d6df3d`.
++
++This is an isolated engine feasibility test, not an RSI training run and not a
++`pvz_rl` evaluation. It uses the user's installed Steam GOTY resources. No game
++assets are included in this checkout. The original Steam executable is not used
++or modified by the experiment.
++
++## Build and run on this workstation
++
++The sibling `../msys64/ucrt64/bin` contains the local MSYS2 GCC/CMake/Ninja
++toolchain and runtime DLLs. Package signatures are verified by pacman.
++
++```powershell
++.\tools\build-harness.ps1
++$env:PATH=(Resolve-Path '..\msys64\ucrt64\bin').Path+';'+$env:PATH
++python .\tools\harness_benchmark.py `
++  --exe .\build-harness\pvz-portable.exe `
++  --resources 'E:\Steam\steamapps\common\Plants Vs Zombies' `
++  --output ..\portable-benchmark-new --episodes 20
++```
++
++Use a new output directory for each run. All profiles and caches must be written
++under its private `save` directory. `engine.log`, per-episode JSON and a final
++`report.json` are retained there.
++
++## Interface and scope
++
++`PVZ_HARNESS=1` selects the experimental adapter. It requires a private
++`-savedir` argument. The application still initializes SDL/OpenGL with a hidden
++window, but advances `Board::Update` without drawing frames or wall-clock sleeps.
++It is not yet a graphics-free server build.
++
++The adapter performs the title screen's music initialization explicitly. In
++experiment mode Foley playback is disabled: the normal implementation's
++wall-clock audio completion changes how many shared RNG draws it consumes.
++This makes paired engine runs reproducible, but their seeded sequence must not
++be equated to the original game with audio enabled. Gameplay rules are still
++provided by the Portable engine. App/game update counters are advanced together.
++
++Commands are read only from the owning process's stdin; responses start with
++`PVZRPC ` followed by JSON. No network port or OS mouse events are used.
++
++- `reset LEVEL SEED`: recreate Adventure 1-1 through 1-10 and skip its intro.
++  Card-choice levels use a fixed public starter loadout. Loading a level is not
++  evidence that the model has beaten it.
++- `state`: observe without advancing time.
++- `render`: write the current game frame to the private save directory's
++  `observation.ppm` without advancing time; the gameplay RNG is preserved.
++- `step TICKS SLOT ROW COL`: advance 1–1000 ticks (100 ticks/game second).
++  SLOT=-1 means wait. A nonnegative slot uses ordinary game placement handlers.
++- `quit`: close this experiment process.
++
++Observations contain current sun, waves, cards, plants, zombies, legal actions,
++terminal status, and mower activation ticks. They do not expose future wave
++contents or RNG state. Sun is collected automatically; no planting strategy is
++implemented. Benchmark actions are exclusively WAIT, so planting effectiveness
++and Jev integration are not validated by its throughput result.
++
++## Acceptance checks
++
++The benchmark tests same-seed replay after an intervening different seed,
++time freezing between commands, invalid placement rejection without mutation,
++and 20 seeded episodes reaching an actual terminal state without truncation.
++An additional full-episode replay after losses includes deliberate wall-clock
++pauses in one repetition. Those two validation episodes are excluded from the
++timed batch. Replay equality compares the observations exposed by the adapter,
++not every internal engine field.
++
++Report both observed wall time and game-time/wall-time ratio. Games/hour is an
++extrapolation from the measured batch, not a long-duration stability result.
++Model inference, Coach/Engineer, parallel lanes and promotion are excluded.
++
++Before use as an RSI gate, validate real Jev placements, winning episodes,
++additional levels, fidelity against the installed game, stable observation/action
++contracts, and separate backend/version identities for candidate and incumbent.
++
++## Original narrow prototype result (2026-10-31, this Windows workstation)
++
++Final output: `../../portable-benchmark-20261031-final/report.json`.
++
++- 20 Adventure 1-4 WAIT-only episodes, seeds 50000–50019; all reached loss.
++- Batch wall time: **1.4740593 s**, including resets and observation I/O.
++- Startup/resource loading: **5.9224721 s**, outside the batch timing.
++- Game-time/wall-time ratio: **2920.78x** for these sparse, unplanted games.
++- All listed checks passed, including full-episode replay after losses and
++  inserted wall-clock pauses. The engine exited normally with code 0.
++- Executable SHA-256:
++  `b78fb0e961698bcc7393d85ad10d9b1c34d7e6f5ba4b95e31c27ac83c8857a6a`.
++
++This establishes fast repeated state-based simulation for this narrow case.
++It does not establish winning performance, 1000-game durability, exact Steam
++game fidelity, or end-to-end RSI throughput. Model calls were zero; no strategy
++was generated, trained or promoted.
++
++## Application integration follow-up
++
++The pvz-agent repository now contains `rsi/portable_runtime.py`,
++`rsi/portable_bridge.py`, `rsi/portable_loop.py` and `docs/portable-rsi.md`.
++Stronger replay testing found that reusing the same engine process can change
++later episode traces for other seeds. The production research adapter therefore
++creates a fresh engine process and private save per episode. The original 1.47s
++batch timing above must not be used as the integrated training throughput.
++Seed 99222 passed complete fresh-process replay with and without screenshots.
++
++Levels 1–10 passed initialization/image checks only. The first actual Planner/Jev
++attempt at 1-1 was blocked by Jev TCP connection refusal, with no completed game
++and no RSI candidate. See the main repository's report for current status.
+diff --git a/tools/build-harness.ps1 b/tools/build-harness.ps1
+new file mode 100644
+index 0000000..5659912
+--- /dev/null
++++ b/tools/build-harness.ps1
+@@ -0,0 +1,15 @@
++[CmdletBinding()]
++param([int]$Jobs=4)
++$ErrorActionPreference='Stop'
++$taskSource=Split-Path -Parent $PSScriptRoot
++$taskTools=Join-Path (Split-Path -Parent $taskSource) 'msys64/ucrt64/bin'
++$taskBuild=Join-Path $taskSource 'build-harness'
++$taskPreviousPath=$env:PATH
++try {
++    $env:PATH=$taskTools+';'+$taskPreviousPath
++    # windres otherwise launches its absolute GCC path without quoting spaces.
++    & (Join-Path $taskTools 'cmake.exe') -S $taskSource -B $taskBuild -G Ninja -DCMAKE_BUILD_TYPE=Release -DCONSOLE=ON -DPVZ_DEBUG=OFF -DBUILD_STATIC=OFF '-DCMAKE_RC_FLAGS=--preprocessor=gcc --preprocessor-arg=-E --preprocessor-arg=-xc --preprocessor-arg=-DRC_INVOKED'
++    if ($LASTEXITCODE) { throw 'Portable configure failed' }
++    & (Join-Path $taskTools 'cmake.exe') --build $taskBuild --parallel $Jobs
++    if ($LASTEXITCODE) { throw 'Portable build failed' }
++} finally { $env:PATH=$taskPreviousPath }
+diff --git a/tools/harness_benchmark.py b/tools/harness_benchmark.py
+new file mode 100644
+index 0000000..d7c5f50
+--- /dev/null
++++ b/tools/harness_benchmark.py
+@@ -0,0 +1,162 @@
++"""Real Portable engine benchmark. WAIT only; not training or a promotion result."""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import queue
++import subprocess
++import threading
++import time
++
++
++def checksum(value):
++    return hashlib.sha256(json.dumps(value,sort_keys=True).encode()).hexdigest()
++
++
++class Engine:
++    def __init__(self,exe,resources,root,runtime_bin=None):
++        self.root=root
++        self.log=(root/'engine.log').open('w',encoding='utf-8')
++        self.queue=queue.Queue()
++        env={**os.environ,'PVZ_HARNESS':'1','SDL_AUDIODRIVER':'dummy'}
++        if runtime_bin: env['PATH']=str(runtime_bin)+os.pathsep+env['PATH']
++        # Keep all profile/cache writes in the experiment's private directory.
++        args=[str(exe),'-resdir',str(resources),'-savedir',str(root/'save')]
++        self.process=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=self.log,
++            text=True,encoding='utf-8',errors='replace',env=env,cwd=root,
++            creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
++        def read():
++            for line in self.process.stdout:
++                if line.startswith('PVZRPC '):
++                    self.queue.put(json.loads(line[7:]))
++                else:
++                    self.log.write(line); self.log.flush()
++            self.queue.put(None)
++        self.reader=threading.Thread(target=read,daemon=True); self.reader.start()
++        try:
++            ready=self.response(180)
++            if not ready.get('ready'): raise RuntimeError('engine not ready')
++        except BaseException:
++            self.close(); raise
++
++    def response(self,timeout=20):
++        try: result=self.queue.get(timeout=timeout)
++        except queue.Empty: raise TimeoutError('Portable response timeout')
++        if result is None:
++            code=self.process.wait(timeout=5)
++            raise RuntimeError(f'Portable exited: {code}; see {self.root}/engine.log')
++        if not result.get('ok'): raise ValueError(result.get('error'))
++        return result
++
++    def call(self,command):
++        self.process.stdin.write(command+'\n'); self.process.stdin.flush()
++        return self.response()
++
++    def close(self):
++        if self.process.poll() is None:
++            try:
++                self.process.stdin.write('quit\n'); self.process.stdin.flush()
++                self.process.wait(timeout=8)
++            except (OSError,subprocess.TimeoutExpired):
++                self.process.kill(); self.process.wait(timeout=5)
++        self.reader.join(timeout=3)
++        for stream in (self.process.stdin,self.process.stdout,self.log):
++            try: stream.close()
++            except OSError: pass
++
++
++def main():
++    p=argparse.ArgumentParser(description=__doc__)
++    p.add_argument('--exe',type=Path,required=True)
++    p.add_argument('--resources',type=Path,required=True)
++    p.add_argument('--output',type=Path,required=True)
++    p.add_argument('--episodes',type=int,default=20)
++    args=p.parse_args()
++    root=args.output.resolve(); root.mkdir(parents=True,exist_ok=False)
++    report=dict(kind='engine_only_wait_baseline',model_calls=0,training=False,episodes=[],
++        executable_sha256=hashlib.sha256(args.exe.read_bytes()).hexdigest())
++    startup=time.perf_counter()
++    engine=Engine(args.exe.resolve(),args.resources.resolve(),root)
++    report['startup_wall_s']=time.perf_counter()-startup
++    print(json.dumps(dict(ready=True,startup_wall_s=report['startup_wall_s'])),flush=True)
++    try:
++        # Replay identical wait actions from the same seed after a different reset.
++        samples=[]
++        replay_states=[]
++        for seed in (424242,81723,424242):
++            state=engine.call(f'reset 4 {seed}')
++            assert state['tick']==0 and state['level']==4 and not state['terminal']
++            path=[checksum(state)]
++            states=[state]
++            for _ in range(12):
++                state=engine.call('step 1000 -1 0 0'); path.append(checksum(state))
++                states.append(state)
++                if state['terminal']: break
++            samples.append(path)
++            replay_states.append(dict(seed=seed,states=states))
++        (root/'replay-check.json').write_text(json.dumps(replay_states,indent=2),encoding='utf-8')
++        report['same_seed_replay_equal']=samples[0]==samples[2]
++        report['different_seed_changes_trace']=samples[0]!=samples[1]
++        if not report['same_seed_replay_equal']:
++            raise RuntimeError('same-seed reset is not deterministic')
++        # Invalid placements must not consume resources or advance game time.
++        before=engine.call('reset 4 31000')
++        time.sleep(.05)
++        assert before==engine.call('state')
++        report['game_frozen_between_commands']=True
++        try: engine.call('step 25 99 0 0')
++        except ValueError as exc: assert str(exc)=='invalid_action_bounds'
++        else: raise AssertionError('invalid placement accepted')
++        assert before==engine.call('state')
++        report['invalid_action_rejected_without_mutation']=True
++        started=time.perf_counter()
++        for index in range(args.episodes):
++            seed=50000+index
++            ep_start=time.perf_counter()
++            state=engine.call(f'reset 4 {seed}')
++            reset_s=time.perf_counter()-ep_start
++            initial=state
++            snapshots=0
++            while not state['terminal'] and state['tick']<60000:
++                previous=state['tick']
++                state=engine.call('step 200 -1 0 0')
++                assert previous<state['tick']<=previous+200
++                snapshots+=1
++            if not state['terminal']: raise RuntimeError('episode truncated at 600 game seconds')
++            result=dict(index=index+1,level=4,seed=seed,outcome=state['outcome'],game_seconds=state['tick']/100,
++                        wall_s=time.perf_counter()-ep_start,reset_wall_s=reset_s,observations=snapshots,
++                        initial_sun=initial['sun'],final=state)
++            report['episodes'].append(result)
++            (root/f'episode-{index+1:02d}.json').write_text(json.dumps(result,indent=2),encoding='utf-8')
++            print(json.dumps({k:v for k,v in result.items() if k!='final'}),flush=True)
++        report['batch_wall_s']=time.perf_counter()-started
++        report['measured_games_per_hour']=len(report['episodes'])*3600/report['batch_wall_s']
++        report['game_seconds_per_wall_second']=sum(e['game_seconds'] for e in report['episodes'])/report['batch_wall_s']
++        # Complete-game replay after losses, with wall-clock pauses in one run.
++        # Excluded from the timed 20-game batch above.
++        full_paths=[]
++        for replay in range(2):
++            state=engine.call('reset 4 50000')
++            path=[checksum(state)]
++            while not state['terminal'] and state['tick']<60000:
++                if replay==1 and state['tick']%4000==0: time.sleep(.02)
++                state=engine.call('step 200 -1 0 0'); path.append(checksum(state))
++            assert state['terminal']
++            full_paths.append(path)
++        report['full_episode_replay_equal_after_losses_and_pauses']=full_paths[0]==full_paths[1]
++        if full_paths[0]!=full_paths[1]: raise RuntimeError('full episode replay diverged')
++        (root/'full-replay-check.json').write_text(json.dumps(full_paths,indent=2),encoding='utf-8')
++        report['status']='passed'
++    except BaseException as exc:
++        report.update(status='failed',error=f'{type(exc).__name__}: {exc}')
++        raise
++    finally:
++        engine.close()
++        report['engine_exit_code']=engine.process.returncode
++        if report['engine_exit_code']!=0: report.update(status='failed',error='nonzero engine exit')
++        (root/'report.json').write_text(json.dumps(report,indent=2),encoding='utf-8')
++    print(json.dumps({k:v for k,v in report.items() if k!='episodes'}),flush=True)
++
++
++if __name__=='__main__': main()

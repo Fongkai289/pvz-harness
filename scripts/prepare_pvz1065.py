@@ -18,7 +18,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-EXTERNAL = ROOT.parent.parent / 'external'
+EXTERNAL = ROOT.parent / 'external'
 PATCH_URL = 'https://www.speedrun.com/static/resource/qwrly.xdelta?v=e3af881'
 RESOURCES_URL = 'https://www.speedrun.com/static/resource/5lam4.zip?v=6e73f4e'
 TOOL_URL = 'https://github.com/jmacd/xdelta/releases/download/v3.2.2/xdelta3-3.2.2-windows-x86_64.zip'

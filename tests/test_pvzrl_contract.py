@@ -13,7 +13,7 @@ def test_pinned_upstream_gym_runs_through_our_episode_adapter(tmp_path):
     pytest.importorskip("pvz_gym")
     from pvz_gym.env import PvZEnv
     from pvz_gym.runtime import RuntimeCapabilities
-    source = Path(__file__).resolve().parents[3] / "external/pvz_rl/tests/fake_backend.py"
+    source = Path(__file__).resolve().parents[2] / "external/pvz_rl/tests/fake_backend.py"
     if not source.exists():
         pytest.skip("optional pinned upstream fixture is not installed on this host")
     spec = importlib.util.spec_from_file_location("native_fact_fixture", source)

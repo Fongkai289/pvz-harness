@@ -56,6 +56,7 @@ def connection(tmp_path):
         result = subprocess.run([
             "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
             "-Mode", mode, "-SshPath", str(fake), "-Key", str(key), "-LogDirectory", str(logs),
+            "-SshHost", "tester@server.example.com", "-Port", "22",
             "-MaxAttempts", "3", "-RetryBaseSeconds", "0", "-RetryMaxSeconds", "0", "-NoJitter",
             "-UseDefaultRoute",
             *extra,

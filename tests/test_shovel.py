@@ -36,6 +36,22 @@ def frame_with_shovel(x0=456):
     return image
 
 
+@pytest.fixture(autouse=True)
+def synthetic_shovel(request, monkeypatch, tmp_path):
+    if request.node.originalname == "test_shovel_box_is_found_by_code_wherever_the_seed_bank_puts_it":
+        yield  # This separate accuracy check still needs the real local crop.
+        return
+    from server import shovel
+    path = tmp_path / "synthetic-shovel.png"
+    crop = np.random.default_rng(17).integers(0, 256, (geometry.SHOVEL_H, geometry.SHOVEL_W, 3), dtype=np.uint8)
+    assert cv2.imwrite(str(path), crop)
+    monkeypatch.setattr(shovel, "PATH", path)
+    monkeypatch.setitem(globals(), "PATH", path)
+    shovel._template.cache_clear()
+    yield
+    shovel._template.cache_clear()
+
+
 def test_gate_allows_one_shovel_in_act_and_fallback_but_not_in_reflex():
     both = [{"type": "shovel", "row": 2, "col": 3}, {"type": "plant", "slot": 1, "row": 2, "col": 3}]
     actions = parse_actions(both, "act", suns=0)

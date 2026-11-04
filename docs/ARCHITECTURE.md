@@ -1,5 +1,7 @@
 # pvz-agent 架构文档
 
+> 部分细节是开发过程快照；当前结果与配置入口以 [PROJECT.md](PROJECT.md)、[reproduce.md](reproduce.md) 为准。
+
 按 2026-11-01 的代码整理。项目现状、各路线进度和与绝悟的对比见 [PROJECT.md](PROJECT.md)；
 本文只讲系统怎么拆、数据怎么流、谁有什么权限。
 

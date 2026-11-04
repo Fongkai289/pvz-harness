@@ -10,13 +10,16 @@ remote script go up as files with scp instead of through a pipe.
 #>
 param(
     [switch]$Test,
-    [string]$SshHost = "operator@server.example.com",
-    [int]$Port = 22,
-    [string]$Key = (Join-Path $PSScriptRoot "..\..\..\pvz_operator"),
-    [string]$RemoteDir = "/srv/pvz-harness"
+    [string]$SshHost = '',
+    [int]$Port = 0,
+    [string]$Key = '',
+    [string]$RemoteDir = ''
 )
 $ErrorActionPreference = "Stop"
 $root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+. (Join-Path $PSScriptRoot 'local_config.ps1')
+$taskSsh=Get-PvzSshSettings -SshHost $SshHost -Port $Port -Key $Key -RemoteDir $RemoteDir -RequireRemoteDir
+$SshHost=$taskSsh.host; $Port=$taskSsh.port; $Key=$taskSsh.key; $RemoteDir=$taskSsh.remote_dir
 $Key = (Resolve-Path $Key).Path
 $ssh = @("-n", "-i", $Key, "-p", $Port, "-o", "BatchMode=yes", "-o", "LogLevel=ERROR")
 $scp = @("-q", "-i", $Key, "-P", $Port, "-o", "BatchMode=yes", "-o", "LogLevel=ERROR")
@@ -39,6 +42,7 @@ try {
         "--exclude", "./.env", "--exclude", "./.venv", "--exclude", "./runs", "--exclude", "./logs",
         "--exclude", "./data", "--exclude", "./.git", "--exclude", "./uv.lock", "--exclude", "./.cache",
         "--exclude", "./.venv-sim",
+        "--exclude", "./local.json", "--exclude", "*.local.json", "--exclude", "./.env.bak-*",
         "--exclude", "__pycache__", "--exclude", ".pytest_cache",
         "-C", $root, ".")
     Write-Host ("tarball {0:N0} KB" -f ((Get-Item $tarball).Length / 1KB))
